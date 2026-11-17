@@ -1,0 +1,10563 @@
+import express from 'express';
+import cors from 'cors';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import fs from 'fs';
+import prisma from './db.js';
+import bcrypt from 'bcrypt';
+import { randomBytes, createHmac } from 'crypto';
+
+import Razorpay from 'razorpay';
+import { sendVerificationEmail, sendPasswordResetEmail, sendWelcomeEmail, sendBookingNotificationEmail, sendBookingConfirmationEmail, sendAdminPaymentNotificationEmail, sendTourApprovalEmail, sendTourRejectionEmail, sendGuideBookingNotificationEmail, sendReviewRequestEmail } from './utils/email.js';
+import { startBookingCrons } from './cron/bookingReminders.js';
+import { startReviewScheduler, sendDueReviewRequests } from './reviewScheduler.js';
+import { startCheckoutRecovery, runCheckoutRecovery, sendInstantRecovery } from './checkoutRecovery.js';
+import { wakeCall, isWakeCallConfigured, describeWakeCall } from './utils/wakeCall.js';
+import { sendBookingAlert, sendPaymentFailedAlert, sendInquiryAlert, logAlertConfig } from './bookingPush.js';
+import { uploadMultipleImages } from './utils/r2.js';
+import { generateInvoicePDF } from './utils/invoice.js';
+import { generateSitemap } from './generate-sitemap.js';
+import mountAgentApi from './agent_api.js';
+import mountMcp from './mcp_server.js';
+import { GoogleAuth } from 'google-auth-library';
+
+// ==================== GOOGLE INDEXING API ====================
+// Automatically notifies Google to crawl/index a URL immediately after tour approval
+const notifyGoogleIndexing = async (url) => {
+  try {
+    const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+    const rawKey = process.env.GOOGLE_PRIVATE_KEY;
+
+    if (!email || !rawKey) {
+      console.log('⚠️  Google Indexing API: credentials not set, skipping');
+      return;
+    }
+
+    // Fix escaped newlines from .env file
+    const privateKey = rawKey.replace(/\\n/g, '\n');
+
+    const auth = new GoogleAuth({
+      credentials: {
+        client_email: email,
+        private_key: privateKey,
+      },
+      scopes: ['https://www.googleapis.com/auth/indexing'],
+    });
+
+    const client = await auth.getClient();
+    const accessToken = await client.getAccessToken();
+
+    const response = await fetch('https://indexing.googleapis.com/v3/urlNotifications:publish', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${accessToken.token}`,
+      },
+      body: JSON.stringify({
+        url: url,
+        type: 'URL_UPDATED',
+      }),
+    });
+
+    const result = await response.json();
+
+    if (response.ok) {
+      console.log(`✅ Google Indexing API: URL submitted successfully`);
+      console.log(`   URL: ${url}`);
+      console.log(`   Response:`, result);
+    } else {
+      console.error(`❌ Google Indexing API error:`, result);
+    }
+  } catch (err) {
+    console.error('❌ Google Indexing API failed (non-critical):', err.message);
+  }
+};
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+// Trust proxy for accurate IP addresses (important for rate limiting)
+app.set('trust proxy', 1);
+
+// Middleware
+// CORS configuration - allows localhost for development and production domains
+const allowedOrigins = [
+  'http://localhost:3000',
+  'http://localhost:4000',
+  process.env.FRONTEND_URL,
+  process.env.VITE_FRONTEND_URL,
+  'https://www.globewithlocals.com',
+  'https://globewithlocals.com',
+  // Add www variant if main domain is set
+  process.env.FRONTEND_URL?.replace('https://', 'https://www.'),
+  process.env.VITE_FRONTEND_URL?.replace('https://', 'https://www.')
+].filter(Boolean); // Remove undefined values
+
+// In production, use specific origins; in development, allow all
+if (process.env.NODE_ENV === 'production' && allowedOrigins.length > 0) {
+  app.use(cors({
+    origin: allowedOrigins,
+    credentials: true
+  }));
+} else {
+  // Development: allow all origins
+  app.use(cors({
+    credentials: true
+  }));
+}
+// Increase body size limit to 50MB for PDF uploads (base64 encoded files are larger)
+// `verify` keeps the untouched request bytes on req.rawBody. Razorpay signs the raw
+// payload, so the webhook below has to hash exactly what was sent — re-serialising
+// the parsed object would change key order/spacing and break the signature.
+app.use(express.json({
+  limit: '50mb',
+  verify: (req, res, buf) => { req.rawBody = buf; }
+}));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// Health check endpoint
+app.get('/api/health', async (req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    res.json({
+      status: 'ok',
+      message: 'GlobeWithLocals API is running',
+      database: 'connected'
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'error',
+      message: 'Database connection failed',
+      error: error.message
+    });
+  }
+});
+
+// ============================================
+// AI ITINERARY GENERATION (GPT-4.1 mini)
+// ============================================
+import OpenAI from 'openai';
+
+const openai = process.env.OPENAI_API_KEY ? new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+}) : null;
+
+app.post('/api/generate-itinerary', async (req, res) => {
+  try {
+    if (!openai) {
+      return res.status(500).json({
+        success: false,
+        error: 'OpenAI API key not configured'
+      });
+    }
+
+    const { answers } = req.body;
+
+    if (!answers || typeof answers !== 'object') {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing or invalid answers object'
+      });
+    }
+
+    console.log('🤖 Generating AI itinerary...');
+
+    const prompt = `You are a professional travel content writer for GlobeWithLocals, a platform connecting travellers with local guides in Asia.
+
+Write a detailed, SEO-optimized tour itinerary description based on the following supplier answers. The output MUST:
+- Be 500–600 words
+- Use ## headings (markdown H2) to separate sections. Use at least 5 ## headings.
+- Include rich, descriptive language with cultural and historical context
+- Be written in second person ("you will", "you'll experience")
+- Include practical details (timings, distances, what to wear, etc.)
+- Feel authentic and personal — written by a local guide, not a corporation
+- NOT include any meta instructions, notes, or explanations — ONLY the itinerary text itself
+- Do NOT use em dashes (—). Use standard hyphens (-) or colons (:) instead.
+
+Here are the supplier's answers:
+
+1. Tour Title/Heading: ${answers[0] || 'N/A'}
+2. Pickup Details (time, location, vehicle): ${answers[1] || 'N/A'}
+3. Route & Drive Duration: ${answers[2] || 'N/A'}
+4. First Major Stop: ${answers[3] || 'N/A'}
+5. Second Major Stop: ${answers[4] || 'N/A'}
+6. Meal/Lunch Arrangements: ${answers[5] || 'N/A'}
+7. Optional Stops or Add-ons: ${answers[6] || 'N/A'}
+8. Return Journey: ${answers[7] || 'N/A'}
+9. What Makes This Tour Special: ${answers[8] || 'N/A'}
+10. Insider Tips for Travellers: ${answers[9] || 'N/A'}
+
+Write the full itinerary now. Start directly with the first ## heading. Do NOT include a title like "# Tour Name" — just start with ## sections.`;
+
+    // Set headers for streaming
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    const stream = await openai.chat.completions.create({
+      model: 'gpt-4.1-mini',
+      max_tokens: 750,
+      temperature: 0.7,
+      stream: true,
+      messages: [
+        {
+          role: 'system',
+          content: 'You are a professional travel content writer who creates detailed, engaging tour itineraries. Always write in markdown with ## headings. Never include meta commentary or instructions in your output.'
+        },
+        {
+          role: 'user',
+          content: prompt
+        }
+      ]
+    });
+
+    for await (const chunk of stream) {
+      const content = chunk.choices[0]?.delta?.content;
+      if (content) {
+        res.write(`data: ${JSON.stringify({ content })}\n\n`);
+      }
+    }
+
+    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+    res.end();
+
+    console.log('✅ AI itinerary generated successfully');
+  } catch (error) {
+    console.error('❌ AI itinerary generation failed:', error);
+
+    // If headers haven't been sent yet, send JSON error
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        error: 'Failed to generate itinerary',
+        message: error.message
+      });
+    } else {
+      // If streaming already started, send error in stream format
+      res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
+      res.end();
+    }
+  }
+});
+
+// Quick email test endpoint (for testing only - DISABLED in production)
+app.post('/api/test-email', async (req, res) => {
+  // SECURITY: Disable in production
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(403).json({
+      success: false,
+      error: 'Forbidden',
+      message: 'This endpoint is disabled in production'
+    });
+  }
+  try {
+    const { email } = req.body;
+    const testEmail = email || process.env.ADMIN_ALERT_EMAIL || 'info@globewithlocals.com'; // Default test email
+
+    console.log('🧪 Testing email sending to:', testEmail);
+
+    const testToken = 'test-token-' + Date.now();
+    const result = await sendVerificationEmail(testEmail, 'Test User', testToken);
+
+    res.json({
+      success: true,
+      message: 'Test email sent successfully!',
+      email: testEmail,
+      messageId: result.messageId,
+      note: 'Check your inbox (and spam folder) for the verification email'
+    });
+  } catch (error) {
+    console.error('❌ Test email failed:', error);
+    const resendApiKey = process.env.RESEND_API_KEY;
+    const sendGridApiKey = process.env.SENDGRID_API_KEY;
+    const emailUser = process.env.EMAIL_USER;
+
+    let details = 'Unknown error - check server logs';
+    if (error.code === 'EAUTH') {
+      details = 'Authentication failed - check API key or credentials';
+    } else if (error.code === 'ETIMEDOUT' || error.code === 'ECONNECTION') {
+      if (!resendApiKey && !sendGridApiKey && !emailUser) {
+        details = 'No email service configured. Add RESEND_API_KEY (recommended), SENDGRID_API_KEY, or EMAIL_USER + EMAIL_APP_PASSWORD to Render environment variables';
+      } else if (emailUser && !resendApiKey && !sendGridApiKey) {
+        details = 'Connection timeout - Gmail SMTP is blocked on Render. Add RESEND_API_KEY or SENDGRID_API_KEY instead';
+      } else {
+        details = 'Connection timeout - check network/firewall settings';
+      }
+    }
+
+    res.status(500).json({
+      success: false,
+      error: 'Failed to send test email',
+      message: error.message,
+      details: details,
+      configured: {
+        resend: !!resendApiKey,
+        sendgrid: !!sendGridApiKey,
+        gmail: !!emailUser
+      }
+    });
+  }
+});
+
+// Test tour approval email endpoint
+app.post('/api/test-tour-approval-email', async (req, res) => {
+  try {
+    const { email } = req.body;
+    const testEmail = email || process.env.ADMIN_ALERT_EMAIL || 'info@globewithlocals.com';
+
+    console.log('🧪 Testing tour approval email sending to:', testEmail);
+
+    // Sample tour data for testing
+    const sampleTourData = {
+      supplierEmail: testEmail,
+      supplierName: 'Mohd Shahnawaz',
+      tourTitle: 'Book Tour Guide For Taj Mahal, Agra Fort & Baby Taj',
+      tourSlug: 'book-tour-guide-for-taj-mahal-agra-fort-baby-taj',
+      city: 'Agra',
+      country: 'India'
+    };
+
+    const result = await sendTourApprovalEmail(
+      sampleTourData.supplierEmail,
+      sampleTourData.supplierName,
+      sampleTourData.tourTitle,
+      sampleTourData.tourSlug,
+      sampleTourData.city,
+      sampleTourData.country
+    );
+
+    res.json({
+      success: true,
+      message: 'Tour approval test email sent successfully!',
+      email: testEmail,
+      messageId: result.messageId,
+      tourData: sampleTourData,
+      note: 'Check your inbox (and spam folder) for the tour approval email'
+    });
+  } catch (error) {
+    console.error('❌ Test tour approval email failed:', error);
+    const resendApiKey = process.env.RESEND_API_KEY;
+    const sendGridApiKey = process.env.SENDGRID_API_KEY;
+    const emailUser = process.env.EMAIL_USER;
+
+    let details = 'Unknown error - check server logs';
+    if (error.code === 'EAUTH') {
+      details = 'Authentication failed - check API key or credentials';
+    } else if (error.code === 'ETIMEDOUT' || error.code === 'ECONNECTION') {
+      if (!resendApiKey && !sendGridApiKey && !emailUser) {
+        details = 'No email service configured. Add RESEND_API_KEY (recommended), SENDGRID_API_KEY, or EMAIL_USER + EMAIL_APP_PASSWORD to Render environment variables';
+      } else if (emailUser && !resendApiKey && !sendGridApiKey) {
+        details = 'Connection timeout - Gmail SMTP is blocked on Render. Add RESEND_API_KEY or SENDGRID_API_KEY instead';
+      } else {
+        details = 'Connection timeout - check network/firewall settings';
+      }
+    }
+
+    res.status(500).json({
+      success: false,
+      error: 'Failed to send test tour approval email',
+      message: error.message,
+      details: details,
+      configured: {
+        resend: !!resendApiKey,
+        sendgrid: !!sendGridApiKey,
+        gmail: !!emailUser
+      }
+    });
+  }
+});
+
+// Check email configuration endpoint
+app.get('/api/email-config', (req, res) => {
+  const resendApiKey = process.env.RESEND_API_KEY;
+  const sendGridApiKey = process.env.SENDGRID_API_KEY;
+  const emailUser = process.env.EMAIL_USER;
+
+  const fromEmail = (resendApiKey || sendGridApiKey) ? 'info@globewithlocals.com' : (emailUser || 'support@globewithlocals.com');
+  const serviceName = resendApiKey ? 'Resend' : (sendGridApiKey ? 'SendGrid' : 'Gmail SMTP');
+
+  res.json({
+    configured: !!(resendApiKey || sendGridApiKey || emailUser),
+    service: serviceName,
+    fromEmail: fromEmail,
+    resendConfigured: !!resendApiKey,
+    sendGridConfigured: !!sendGridApiKey,
+    gmailConfigured: !!emailUser
+  });
+});
+
+// Register supplier endpoint
+app.post('/api/suppliers/register', async (req, res) => {
+  try {
+    const {
+      businessType,
+      companyEmployees,
+      companyActivities,
+      individualActivities,
+      otherActivities,
+      fullName,
+      email: rawEmail,
+      password,
+      companyName,
+      mainHub,
+      city,
+      tourLanguages,
+      verificationDocumentUrl,
+      phone,
+      whatsapp,
+      language
+    } = req.body;
+
+    // Trim and normalize email
+    const email = rawEmail ? rawEmail.trim().toLowerCase() : null;
+
+    // Log the email received and processed
+    console.log('📥 Registration request received:');
+    console.log('   Raw email from request:', rawEmail);
+    console.log('   Processed email:', email);
+
+    // Validate required fields
+    if (!businessType || !fullName || !email || !password) {
+      return res.status(400).json({
+        error: 'Missing required fields',
+        required: ['businessType', 'fullName', 'email', 'password']
+      });
+    }
+
+    // Check if email already exists using Prisma
+    // Use retry logic for Render free tier connection issues
+    let existingSupplier = null;
+    let checkAttempts = 0;
+    const MAX_CHECK_RETRIES = 3;
+
+    while (checkAttempts < MAX_CHECK_RETRIES && existingSupplier === null) {
+      try {
+        existingSupplier = await prisma.supplier.findUnique({
+          where: { email },
+          select: {
+            id: true,
+            email: true,
+            fullName: true,
+            businessType: true,
+            status: true,
+            emailVerified: true,
+            createdAt: true
+          }
+        });
+        break; // Success, exit retry loop
+      } catch (dbError) {
+        checkAttempts++;
+        console.error(`❌ Database error checking existing supplier (attempt ${checkAttempts}/${MAX_CHECK_RETRIES}):`, dbError.message);
+
+        // If it's a connection error and we have retries left, wait and retry
+        if (checkAttempts < MAX_CHECK_RETRIES && (
+          dbError.message?.includes('connection') ||
+          dbError.message?.includes('timeout') ||
+          dbError.code === 'P1001' ||
+          dbError.code === 'P1017'
+        )) {
+          console.log(`   Retrying in ${checkAttempts * 500}ms...`);
+          await new Promise(resolve => setTimeout(resolve, checkAttempts * 500));
+          continue;
+        }
+
+        // If database check fails completely, continue with registration attempt
+        // Prisma will catch duplicate email error during create
+        console.log('   Continuing with registration - will handle duplicate email during create');
+        existingSupplier = null;
+        break;
+      }
+    }
+
+    if (existingSupplier) {
+      // If email exists, allow them to continue registration
+      // Generate new verification token if not verified
+      let verificationToken = null;
+      let verificationExpires = null;
+
+      if (!existingSupplier.emailVerified) {
+        verificationToken = randomBytes(32).toString('hex');
+        verificationExpires = new Date();
+        verificationExpires.setHours(verificationExpires.getHours() + 48); // 48 hours expiry
+
+        // Update supplier with new verification token
+        await prisma.supplier.update({
+          where: { id: existingSupplier.id },
+          data: {
+            emailVerificationToken: verificationToken,
+            emailVerificationExpires: verificationExpires
+          }
+        });
+
+        // Resend verification email
+        try {
+          console.log(`📧 Resending verification email to existing supplier:`);
+          console.log(`   User entered: ${rawEmail}`);
+          console.log(`   Email in DB: ${existingSupplier.email}`);
+          console.log(`   Email to send to: ${email}`);
+          await sendVerificationEmail(email, existingSupplier.fullName, verificationToken, language || 'en');
+          console.log(`✅ Verification email resent to ${email}`);
+          console.log(`   ⚠️ IMPORTANT: Verify email address matches what user entered!`);
+        } catch (emailError) {
+          console.error('❌ Failed to resend verification email:', emailError);
+        }
+      }
+
+      // Convert id to string for consistency with frontend
+      const supplierResponse = {
+        ...existingSupplier,
+        id: String(existingSupplier.id)
+      };
+
+      // Return existing supplier and allow them to proceed
+      return res.status(200).json({
+        success: true,
+        message: existingSupplier.emailVerified
+          ? 'Account found. You can continue with your registration.'
+          : 'Account found. Please check your email to verify your account.',
+        supplier: supplierResponse,
+        emailSent: !existingSupplier.emailVerified && verificationToken !== null,
+        existingAccount: true
+      });
+    }
+
+    // Hash password
+    const saltRounds = 10;
+    const passwordHash = await bcrypt.hash(password, saltRounds);
+
+    // Generate email verification token
+    const verificationToken = randomBytes(32).toString('hex');
+    const verificationExpires = new Date();
+    verificationExpires.setHours(verificationExpires.getHours() + 48); // 48 hours expiry (increased from 24)
+
+    // Upload verification document to R2 if provided and R2 is configured
+    let finalDocumentUrl = verificationDocumentUrl;
+    if (verificationDocumentUrl && process.env.R2_ACCOUNT_ID && process.env.R2_ACCESS_KEY_ID && process.env.R2_SECRET_ACCESS_KEY) {
+      try {
+        console.log('☁️  Uploading verification document to R2...');
+
+        // Check if it's a PDF or image
+        const isPDF = verificationDocumentUrl.startsWith('data:application/pdf');
+        const isImage = verificationDocumentUrl.startsWith('data:image/');
+
+        if (isPDF) {
+          const base64Data = verificationDocumentUrl.includes(',')
+            ? verificationDocumentUrl.split(',')[1]
+            : verificationDocumentUrl;
+          const { uploadDocument } = await import('./utils/r2.js');
+          finalDocumentUrl = await uploadDocument(base64Data, 'globewithlocals/suppliers/documents', `license_${Date.now()}_${email.split('@')[0]}`);
+          console.log('✅ Verification document uploaded to R2:', finalDocumentUrl);
+        } else if (isImage) {
+          const { uploadImage } = await import('./utils/r2.js');
+          finalDocumentUrl = await uploadImage(verificationDocumentUrl, 'globewithlocals/suppliers/documents', `license_${Date.now()}_${email.split('@')[0]}`);
+          console.log('✅ Verification document uploaded to R2:', finalDocumentUrl);
+        }
+      } catch (uploadError) {
+        console.error('❌ R2 upload error for verification document:', uploadError);
+        console.error('   Falling back to base64 storage');
+        // Continue with base64 if R2 upload fails
+        finalDocumentUrl = verificationDocumentUrl;
+      }
+    }
+
+    // Create supplier using Prisma
+    // Wrap in try-catch with retry logic for Render free tier connection issues
+    let supplier;
+    let createAttempts = 0;
+    const MAX_CREATE_RETRIES = 3;
+    let createError = null;
+
+    while (createAttempts < MAX_CREATE_RETRIES && !supplier) {
+      try {
+        supplier = await prisma.supplier.create({
+          data: {
+            businessType,
+            companyEmployees: companyEmployees || null,
+            companyActivities: companyActivities || null,
+            individualActivities: individualActivities || null,
+            otherActivities: otherActivities || null,
+            fullName,
+            email,
+            passwordHash,
+            companyName: companyName || null,
+            mainHub: mainHub || null,
+            city: city || null,
+            tourLanguages: tourLanguages || null,
+            verificationDocumentUrl: finalDocumentUrl || null,
+            phone: phone || null,
+            whatsapp: whatsapp || null,
+            emailVerificationToken: verificationToken,
+            emailVerificationExpires: verificationExpires,
+            emailVerified: false,
+            status: 'pending' // Require admin approval after license upload
+          },
+          select: {
+            id: true,
+            email: true,
+            fullName: true,
+            businessType: true,
+            status: true,
+            emailVerified: true,
+            createdAt: true
+          }
+        });
+        break; // Success, exit retry loop
+      } catch (error) {
+        createAttempts++;
+        createError = error;
+
+        // Handle duplicate email error (race condition)
+        if (error.code === 'P2002' && error.meta?.target?.includes('email')) {
+          console.log('   ⚠️ Email was created between check and create (race condition)');
+          console.log('   Fetching existing supplier and resending verification email...');
+
+          // Fetch the existing supplier with retry
+          let raceConditionSupplier = null;
+          let fetchAttempts = 0;
+          while (fetchAttempts < MAX_CREATE_RETRIES && !raceConditionSupplier) {
+            try {
+              raceConditionSupplier = await prisma.supplier.findUnique({
+                where: { email },
+                select: {
+                  id: true,
+                  email: true,
+                  fullName: true,
+                  businessType: true,
+                  status: true,
+                  emailVerified: true,
+                  createdAt: true
+                }
+              });
+              break;
+            } catch (fetchError) {
+              fetchAttempts++;
+              if (fetchAttempts < MAX_CREATE_RETRIES && (
+                fetchError.message?.includes('connection') ||
+                fetchError.message?.includes('timeout') ||
+                fetchError.code === 'P1001' ||
+                fetchError.code === 'P1017'
+              )) {
+                await new Promise(resolve => setTimeout(resolve, fetchAttempts * 500));
+                continue;
+              }
+              throw fetchError;
+            }
+          }
+
+          if (raceConditionSupplier) {
+            // Generate new verification token
+            const newToken = randomBytes(32).toString('hex');
+            const newExpires = new Date();
+            newExpires.setHours(newExpires.getHours() + 48);
+
+            // Update supplier with retry
+            let updateSuccess = false;
+            let updateAttempts = 0;
+            while (updateAttempts < MAX_CREATE_RETRIES && !updateSuccess) {
+              try {
+                await prisma.supplier.update({
+                  where: { id: raceConditionSupplier.id },
+                  data: {
+                    emailVerificationToken: newToken,
+                    emailVerificationExpires: newExpires
+                  }
+                });
+                updateSuccess = true;
+              } catch (updateError) {
+                updateAttempts++;
+                if (updateAttempts < MAX_CREATE_RETRIES && (
+                  updateError.message?.includes('connection') ||
+                  updateError.message?.includes('timeout') ||
+                  updateError.code === 'P1001' ||
+                  updateError.code === 'P1017'
+                )) {
+                  await new Promise(resolve => setTimeout(resolve, updateAttempts * 500));
+                  continue;
+                }
+                throw updateError;
+              }
+            }
+
+            // Resend verification email
+            let emailSent = false;
+            try {
+              await sendVerificationEmail(email, raceConditionSupplier.fullName || fullName, newToken, language || 'en');
+              emailSent = true;
+            } catch (emailError) {
+              console.error('   Failed to send verification email:', emailError);
+            }
+
+            // Return success response
+            return res.status(200).json({
+              success: true,
+              message: 'Account found. Please check your email to verify your account.',
+              supplier: {
+                ...raceConditionSupplier,
+                id: String(raceConditionSupplier.id)
+              },
+              emailSent: emailSent,
+              existingAccount: true
+            });
+          }
+        }
+
+        // If it's a connection error and we have retries left, wait and retry
+        if (createAttempts < MAX_CREATE_RETRIES && (
+          error.message?.includes('connection') ||
+          error.message?.includes('timeout') ||
+          error.message?.includes('ECONNREFUSED') ||
+          error.message?.includes('ETIMEDOUT') ||
+          error.code === 'P1001' ||
+          error.code === 'P1017' ||
+          error.code === 'P1008'
+        )) {
+          console.log(`   Connection error, retrying in ${createAttempts * 1000}ms...`);
+          await new Promise(resolve => setTimeout(resolve, createAttempts * 1000));
+          continue;
+        }
+
+        // Not a retryable error, break and handle below
+        break;
+      }
+    }
+
+    // If we still don't have a supplier after retries, handle the error
+    if (!supplier && createError) {
+      // Handle race condition: email might have been created between check and create
+      if (createError.code === 'P2002' && createError.meta?.target?.includes('email')) {
+        console.log('   ⚠️ Email was created between check and create (race condition)');
+        console.log('   Fetching existing supplier and resending verification email...');
+
+        // Fetch the existing supplier
+        const raceConditionSupplier = await prisma.supplier.findUnique({
+          where: { email },
+          select: {
+            id: true,
+            email: true,
+            fullName: true,
+            businessType: true,
+            status: true,
+            emailVerified: true,
+            createdAt: true
+          }
+        });
+
+        if (raceConditionSupplier) {
+          // Generate new verification token
+          const newToken = randomBytes(32).toString('hex');
+          const newExpires = new Date();
+          newExpires.setHours(newExpires.getHours() + 48);
+
+          await prisma.supplier.update({
+            where: { id: raceConditionSupplier.id },
+            data: {
+              emailVerificationToken: newToken,
+              emailVerificationExpires: newExpires
+            }
+          });
+
+          // Resend verification email
+          let emailSent = false;
+          try {
+            await sendVerificationEmail(email, raceConditionSupplier.fullName || fullName, newToken, language || 'en');
+            emailSent = true;
+          } catch (emailError) {
+            console.error('   Failed to send verification email:', emailError);
+          }
+
+          // Return success response
+          return res.status(200).json({
+            success: true,
+            message: 'Account found. Please check your email to verify your account.',
+            supplier: {
+              ...raceConditionSupplier,
+              id: String(raceConditionSupplier.id)
+            },
+            emailSent: emailSent,
+            existingAccount: true
+          });
+        }
+      }
+      // Re-throw if it's not a duplicate email error
+      throw createError;
+    }
+
+    // Send verification email (don't fail registration if this fails)
+    console.log(`📧 Preparing to send verification email:`);
+    console.log(`   To: ${email}`);
+    console.log(`   Full Name: ${fullName}`);
+    console.log(`   Token: ${verificationToken.substring(0, 10)}...`);
+    console.log(`   Supplier ID: ${supplier.id}`);
+    console.log(`   Email stored in DB: ${supplier.email}`);
+
+    let emailSent = false;
+
+    try {
+      const emailResult = await sendVerificationEmail(email, fullName, verificationToken, language || 'en');
+      console.log(`✅ Verification email sent successfully to: ${email}`);
+      console.log(`   Message ID: ${emailResult.messageId}`);
+      console.log(`   ⚠️ IMPORTANT: Verify email address matches what user entered!`);
+      console.log(`   User entered: ${rawEmail}`);
+      console.log(`   Email sent to: ${email}`);
+      emailSent = true;
+    } catch (emailError) {
+      console.error(`❌ Failed to send verification email to ${email}:`);
+      console.error(`   Error: ${emailError.message || emailError}`);
+      console.error(`   Full error:`, emailError);
+      // Don't fail registration if email fails - user can request resend later
+      emailSent = false;
+    }
+
+    // Convert id to string for consistency with frontend
+    const supplierResponse = {
+      ...supplier,
+      id: String(supplier.id)
+    };
+
+    // Always return success even if email failed - user can resend verification email
+    res.status(201).json({
+      success: true,
+      message: emailSent
+        ? 'Registration successful! Please check your email to verify your account.'
+        : 'Registration successful! However, we couldn\'t send the verification email right now. Please use "Resend Verification Email" on the supplier page.',
+      supplier: supplierResponse,
+      emailSent: emailSent,
+      warning: emailSent ? undefined : 'Email service temporarily unavailable. You can request a new verification email after logging in.'
+    });
+  } catch (error) {
+    console.error('❌ Registration error:', error);
+    console.error('   Error message:', error.message);
+    console.error('   Error stack:', error.stack);
+    console.error('   Error name:', error.name);
+    console.error('   Error code:', error.code);
+    console.error('   Error meta:', error.meta);
+
+    // Check for specific Prisma error types and provide helpful messages
+    let errorMessage = 'Failed to register supplier. Please try again later.';
+    let statusCode = 500;
+
+    // Database connection errors
+    if (error.code === 'P1001' || error.message?.includes('Can\'t reach database') || error.message?.includes('connection')) {
+      errorMessage = 'Database connection error. Please try again in a few moments.';
+      statusCode = 503; // Service Unavailable
+    }
+    // Unique constraint violation (duplicate email)
+    else if (error.code === 'P2002') {
+      const target = error.meta?.target || [];
+      if (target.includes('email')) {
+        errorMessage = 'An account with this email already exists. Please use a different email or log in.';
+        statusCode = 409; // Conflict
+      } else {
+        errorMessage = 'A record with this information already exists. Please check your details and try again.';
+        statusCode = 409;
+      }
+    }
+    // Foreign key constraint violation
+    else if (error.code === 'P2003') {
+      errorMessage = 'Invalid registration data. Please check all fields and try again.';
+      statusCode = 400; // Bad Request
+    }
+    // Prisma validation errors
+    else if (error.code === 'P2011' || error.code === 'P2012') {
+      errorMessage = 'Invalid registration data. Please check all required fields are filled correctly.';
+      statusCode = 400; // Bad Request
+    }
+    // Record not found
+    else if (error.code === 'P2025') {
+      errorMessage = 'Registration data not found. Please try again.';
+      statusCode = 404; // Not Found
+    }
+    // Email sending errors (don't fail registration, just log)
+    else if (error.message?.includes('email') || error.message?.includes('Email')) {
+      // Registration succeeded but email failed - still return success
+      console.error('   ⚠️ Registration succeeded but email sending failed');
+      console.error('   User can request a new verification email later');
+      // Don't throw - registration was successful
+      return res.status(201).json({
+        success: true,
+        message: 'Registration successful! However, we couldn\'t send the verification email. Please use "Resend Verification Email" on the supplier page.',
+        supplier: {
+          id: 'unknown', // We don't have supplier ID if email failed
+          email: email,
+          emailVerified: false
+        },
+        emailSent: false,
+        warning: 'Email service temporarily unavailable'
+      });
+    }
+
+    // Return more detailed error in development
+    const errorDetails = process.env.NODE_ENV === 'development' ? {
+      message: error.message,
+      code: error.code,
+      name: error.name,
+      meta: error.meta
+    } : undefined;
+
+    res.status(statusCode).json({
+      error: statusCode === 500 ? 'Internal server error' : (error.name || 'Registration error'),
+      message: errorMessage,
+      details: errorDetails
+    });
+  }
+});
+
+// ---- Supplier password reset (the login page's "Forgot password?" was a dead button until 2026-09-20) ----
+// Reuses the email-verification token columns; a reset token is prefixed so it
+// can never be mistaken for a verification token.
+app.post('/api/suppliers/forgot-password', async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  // Always answer the same way so the endpoint cannot be used to probe which emails exist.
+  const ok = () => res.json({ success: true, message: 'If that email has a partner account, a reset link is on its way.' });
+  if (!email || !email.includes('@')) return ok();
+  try {
+    const supplier = await prisma.supplier.findFirst({ where: { email: { equals: email, mode: 'insensitive' } }, select: { id: true, email: true, fullName: true } });
+    if (!supplier) return ok();
+    const token = 'pr_' + randomBytes(24).toString('hex');
+    await prisma.supplier.update({ where: { id: supplier.id }, data: { emailVerificationToken: token, emailVerificationExpires: new Date(Date.now() + 60 * 60 * 1000) } });
+    await sendPasswordResetEmail(supplier.email, supplier.fullName, token);
+    console.log(`🔑 Password reset email sent to supplier ${supplier.id}`);
+  } catch (e) {
+    console.error('forgot-password error:', e.message);
+  }
+  return ok();
+});
+
+app.post('/api/suppliers/reset-password', async (req, res) => {
+  const token = String(req.body?.token || '').trim();
+  const password = String(req.body?.password || '');
+  if (!token.startsWith('pr_')) return res.status(400).json({ success: false, error: 'Invalid or expired reset link' });
+  if (password.length < 8) return res.status(400).json({ success: false, error: 'Password must be at least 8 characters' });
+  try {
+    const supplier = await prisma.supplier.findFirst({ where: { emailVerificationToken: token }, select: { id: true, emailVerificationExpires: true } });
+    if (!supplier || !supplier.emailVerificationExpires || supplier.emailVerificationExpires < new Date()) {
+      return res.status(400).json({ success: false, error: 'Invalid or expired reset link' });
+    }
+    const passwordHash = await bcrypt.hash(password, 10);
+    await prisma.supplier.update({ where: { id: supplier.id }, data: { passwordHash, emailVerificationToken: null, emailVerificationExpires: null } });
+    console.log(`🔑 Password reset completed for supplier ${supplier.id}`);
+    return res.json({ success: true, message: 'Password updated. You can sign in now.' });
+  } catch (e) {
+    console.error('reset-password error:', e.message);
+    return res.status(500).json({ success: false, error: 'Could not reset password' });
+  }
+});
+
+// Get supplier by email (for login)
+app.post('/api/suppliers/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({
+        error: 'Email and password are required'
+      });
+    }
+
+    // Normalize email (trim and lowercase)
+    const normalizedEmail = email.trim().toLowerCase();
+
+    console.log('🔐 Login attempt:');
+    console.log('   Email provided:', email);
+    console.log('   Normalized email:', normalizedEmail);
+
+    // Find supplier using Prisma with retry logic for Render free tier
+    let supplier = null;
+    let findAttempts = 0;
+    const MAX_FIND_RETRIES = 3;
+
+    while (findAttempts < MAX_FIND_RETRIES && !supplier) {
+      try {
+        supplier = await prisma.supplier.findUnique({
+          where: { email: normalizedEmail },
+          select: {
+            id: true,
+            email: true,
+            fullName: true,
+            passwordHash: true,
+            status: true,
+            emailVerified: true,
+            phone: true,
+            whatsapp: true
+          }
+        });
+        break; // Success, exit retry loop
+      } catch (dbError) {
+        findAttempts++;
+        console.error(`   Database error finding supplier (attempt ${findAttempts}/${MAX_FIND_RETRIES}):`, dbError.message);
+
+        // If it's a connection error and we have retries left, wait and retry
+        if (findAttempts < MAX_FIND_RETRIES && (
+          dbError.message?.includes('connection') ||
+          dbError.message?.includes('timeout') ||
+          dbError.code === 'P1001' ||
+          dbError.code === 'P1017' ||
+          dbError.code === 'P1008'
+        )) {
+          console.log(`   Retrying in ${findAttempts * 500}ms...`);
+          await new Promise(resolve => setTimeout(resolve, findAttempts * 500));
+          continue;
+        }
+        // Not a retryable error, break and handle below
+        throw dbError;
+      }
+    }
+
+    if (!supplier) {
+      console.log('   ❌ Supplier not found in database');
+      console.log('   Checking for similar emails...');
+
+      // Try case-insensitive search as fallback
+      try {
+        const similarSuppliers = await prisma.supplier.findMany({
+          where: {
+            email: {
+              contains: normalizedEmail.split('@')[0],
+              mode: 'insensitive'
+            }
+          },
+          select: {
+            email: true,
+            emailVerified: true
+          },
+          take: 5
+        });
+
+        if (similarSuppliers.length > 0) {
+          console.log('   Found similar emails:', similarSuppliers.map(s => s.email).join(', '));
+        }
+      } catch (e) {
+        // Ignore fallback search errors
+      }
+
+      return res.status(401).json({
+        error: 'Invalid credentials',
+        message: 'Email or password is incorrect. If you just verified your email, please wait a moment and try again.'
+      });
+    }
+
+    console.log('   ✅ Supplier found:');
+    console.log('      ID:', supplier.id);
+    console.log('      Email:', supplier.email);
+    console.log('      Email Verified:', supplier.emailVerified);
+
+    // Compare password with retry logic for database connection issues
+    let passwordMatch = false;
+    try {
+      passwordMatch = await bcrypt.compare(password, supplier.passwordHash);
+      console.log('   Password match:', passwordMatch ? '✅ YES' : '❌ NO');
+    } catch (bcryptError) {
+      console.error('   ❌ Error comparing password:', bcryptError.message);
+      return res.status(500).json({
+        error: 'Internal server error',
+        message: 'Failed to verify password. Please try again.'
+      });
+    }
+
+    if (!passwordMatch) {
+      console.log('   ❌ Password mismatch');
+      return res.status(401).json({
+        error: 'Invalid credentials',
+        message: 'Email or password is incorrect'
+      });
+    }
+
+    // Check if email is verified
+    if (!supplier.emailVerified) {
+      return res.status(403).json({
+        error: 'Email not verified',
+        message: 'Please verify your email address before logging in. Check your inbox for the verification link.'
+      });
+    }
+
+    // Remove password hash from response
+    const { passwordHash, ...supplierData } = supplier;
+
+    // Convert id to string for consistency and ensure all required fields
+    const supplierResponse = {
+      id: String(supplierData.id),
+      email: supplierData.email,
+      fullName: supplierData.fullName,
+      status: supplierData.status,
+      emailVerified: supplierData.emailVerified,
+      phone: supplierData.phone || null,
+      whatsapp: supplierData.whatsapp || null
+    };
+
+    console.log('✅ Login successful for:', supplierData.email);
+    console.log('📤 Returning supplier data:', JSON.stringify(supplierResponse, null, 2));
+
+    res.json({
+      success: true,
+      supplier: supplierResponse
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Failed to login. Please try again later.',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Tourist Signup endpoint
+app.post('/api/tourists/signup', async (req, res) => {
+  try {
+    const { name, email: rawEmail, password } = req.body;
+
+    // Trim and normalize email
+    const email = rawEmail ? rawEmail.trim().toLowerCase() : null;
+
+    // Validate required fields
+    if (!name || !email || !password) {
+      return res.status(400).json({
+        error: 'Missing required fields',
+        message: 'Name, email, and password are required'
+      });
+    }
+
+    // Validate password length
+    if (password.length < 6) {
+      return res.status(400).json({
+        error: 'Password too short',
+        message: 'Password must be at least 6 characters'
+      });
+    }
+
+    // Check if email already exists
+    const existingTourist = await prisma.tourist.findUnique({
+      where: { email }
+    });
+
+    if (existingTourist) {
+      return res.status(400).json({
+        error: 'Email already exists',
+        message: 'An account with this email already exists. Please sign in instead.'
+      });
+    }
+
+    // Hash password
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    // Create tourist
+    const tourist = await prisma.tourist.create({
+      data: {
+        name,
+        email,
+        passwordHash
+      },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        createdAt: true
+      }
+    });
+
+    res.json({
+      success: true,
+      tourist: {
+        id: String(tourist.id),
+        name: tourist.name,
+        email: tourist.email
+      }
+    });
+  } catch (error) {
+    console.error('Tourist signup error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Failed to create account. Please try again later.'
+    });
+  }
+});
+
+// Tourist Login endpoint
+app.post('/api/tourists/login', async (req, res) => {
+  try {
+    const { email: rawEmail, password } = req.body;
+
+    // Normalize email
+    const email = rawEmail ? rawEmail.trim().toLowerCase() : null;
+
+    if (!email || !password) {
+      return res.status(400).json({
+        error: 'Email and password are required'
+      });
+    }
+
+    // Find tourist
+    const tourist = await prisma.tourist.findUnique({
+      where: { email },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        passwordHash: true
+      }
+    });
+
+    if (!tourist) {
+      return res.status(401).json({
+        error: 'Invalid credentials',
+        message: 'Email or password is incorrect'
+      });
+    }
+
+    // Compare password
+    const passwordMatch = await bcrypt.compare(password, tourist.passwordHash);
+
+    if (!passwordMatch) {
+      return res.status(401).json({
+        error: 'Invalid credentials',
+        message: 'Email or password is incorrect'
+      });
+    }
+
+    // Remove password hash from response
+    const { passwordHash, ...touristData } = tourist;
+
+    res.json({
+      success: true,
+      tourist: {
+        id: String(touristData.id),
+        name: touristData.name,
+        email: touristData.email
+      }
+    });
+  } catch (error) {
+    console.error('Tourist login error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Failed to login. Please try again later.'
+    });
+  }
+});
+
+// Email Subscription Endpoints
+
+// Subscribe to city itinerary email
+app.post('/api/email/subscribe', async (req, res) => {
+  try {
+    const { email: rawEmail, city, country, subscriptionType = 'itinerary' } = req.body;
+
+    // Normalize email
+    const email = rawEmail ? rawEmail.trim().toLowerCase() : null;
+
+    // Validate required fields
+    if (!email || !city || !country) {
+      return res.status(400).json({
+        error: 'Missing required fields',
+        message: 'Email, city, and country are required'
+      });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({
+        error: 'Invalid email format',
+        message: 'Please provide a valid email address'
+      });
+    }
+
+    // Check for existing subscription
+    const existingSubscription = await prisma.emailSubscription.findUnique({
+      where: {
+        email_city_subscriptionType: {
+          email,
+          city,
+          subscriptionType
+        }
+      }
+    });
+
+    if (existingSubscription) {
+      if (existingSubscription.verified) {
+        return res.status(400).json({
+          error: 'Already subscribed',
+          message: 'You are already subscribed to this itinerary'
+        });
+      } else {
+        // Resend verification email if not verified
+        const verificationToken = randomBytes(32).toString('hex');
+        await prisma.emailSubscription.update({
+          where: { id: existingSubscription.id },
+          data: { verificationToken }
+        });
+
+        // Import email function dynamically to avoid circular dependency
+        const { sendItineraryVerificationEmail } = await import('./utils/email.js');
+        await sendItineraryVerificationEmail(email, city, verificationToken);
+
+        return res.json({
+          success: true,
+          message: 'Verification email sent. Please check your inbox.'
+        });
+      }
+    }
+
+    // Generate verification token
+    const verificationToken = randomBytes(32).toString('hex');
+
+    // Create subscription
+    await prisma.emailSubscription.create({
+      data: {
+        email,
+        city,
+        country,
+        subscriptionType,
+        verificationToken,
+        verified: false
+      }
+    });
+
+    // Send verification email
+    const { sendItineraryVerificationEmail } = await import('./utils/email.js');
+    await sendItineraryVerificationEmail(email, city, verificationToken);
+
+    res.json({
+      success: true,
+      message: 'Subscription created. Please check your email to verify.'
+    });
+  } catch (error) {
+    console.error('Email subscription error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Failed to create subscription. Please try again later.'
+    });
+  }
+});
+
+// Verify email subscription
+app.get('/api/email/verify/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+
+    if (!token) {
+      return res.status(400).json({
+        error: 'Verification token is required'
+      });
+    }
+
+    // Find subscription by token
+    const subscription = await prisma.emailSubscription.findFirst({
+      where: { verificationToken: token }
+    });
+
+    if (!subscription) {
+      return res.status(404).json({
+        error: 'Invalid token',
+        message: 'Verification token not found or expired'
+      });
+    }
+
+    if (subscription.verified) {
+      // Already verified - redirect to success page
+      const frontendUrl = process.env.FRONTEND_URL || process.env.VITE_FRONTEND_URL || 'http://localhost:3000';
+      return res.redirect(`${frontendUrl}/email-verified?city=${encodeURIComponent(subscription.city || '')}`);
+    }
+
+    // Mark as verified
+    await prisma.emailSubscription.update({
+      where: { id: subscription.id },
+      data: {
+        verified: true,
+        verifiedAt: new Date(),
+        verificationToken: null // Clear token after verification
+      }
+    });
+
+    // Send welcome email with itinerary
+    const { sendItineraryWelcomeEmail } = await import('./utils/email.js');
+    await sendItineraryWelcomeEmail(subscription.email, subscription.city || '');
+
+    // Redirect to success page
+    const frontendUrl = process.env.FRONTEND_URL || process.env.VITE_FRONTEND_URL || 'http://localhost:3000';
+    res.redirect(`${frontendUrl}/email-verified?city=${encodeURIComponent(subscription.city || '')}`);
+  } catch (error) {
+    console.error('Email verification error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Failed to verify subscription. Please try again later.'
+    });
+  }
+});
+
+// Verify email endpoint - MUST come before /api/suppliers/:id route
+app.get('/api/suppliers/verify-email', async (req, res) => {
+  try {
+    let { token } = req.query;
+
+    console.log('🔍 Email verification request received');
+    console.log('   Raw token from query:', token ? `${token.substring(0, 20)}...` : 'MISSING');
+    console.log('   Raw token length:', token ? token.length : 0);
+    console.log('   Request URL:', req.url);
+    console.log('   Query params:', JSON.stringify(req.query));
+
+    if (!token) {
+      return res.status(400).json({
+        error: 'Verification token is required',
+        message: 'Please provide a valid verification token'
+      });
+    }
+
+    // Normalize token: decode, trim whitespace, remove any email client modifications
+    // Email clients often add tracking parameters or wrap URLs
+    try {
+      // Decode URL encoding
+      token = decodeURIComponent(token);
+    } catch (e) {
+      // If decode fails, token might already be decoded or corrupted
+      console.log('   ⚠️ Token decode failed, using as-is');
+    }
+
+    // Trim whitespace and remove any trailing parameters email clients might add
+    token = token.trim();
+    // Remove common email client tracking parameters
+    token = token.split('&')[0].split('#')[0].split('?')[0];
+    token = token.trim();
+
+    console.log('   Normalized token:', token ? `${token.substring(0, 20)}...` : 'MISSING');
+    console.log('   Normalized token length:', token ? token.length : 0);
+    console.log('   Expected token length: 64 (32 bytes hex)');
+
+    // Validate token format (should be 64 character hex string)
+    if (token.length !== 64 || !/^[a-f0-9]{64}$/i.test(token)) {
+      console.log('   ❌ Token format invalid - not 64 character hex string');
+      console.log('   Token received:', token);
+
+      // Try to find supplier by partial token match (in case email client truncated it)
+      const allSuppliers = await prisma.supplier.findMany({
+        where: {
+          emailVerificationToken: {
+            not: null
+          }
+        },
+        select: {
+          id: true,
+          email: true,
+          emailVerificationToken: true,
+          emailVerificationExpires: true,
+          emailVerified: true
+        }
+      });
+
+      // Try partial match (first 32 characters)
+      if (token.length >= 32) {
+        const partialToken = token.substring(0, 32);
+        console.log('   Trying partial token match:', partialToken);
+        const partialMatch = allSuppliers.find(s =>
+          s.emailVerificationToken && s.emailVerificationToken.startsWith(partialToken)
+        );
+
+        if (partialMatch) {
+          console.log('   ✅ Found supplier with partial token match!');
+          token = partialMatch.emailVerificationToken; // Use full token from DB
+        }
+      }
+
+      // If still no match, return error
+      if (token.length !== 64 || !/^[a-f0-9]{64}$/i.test(token)) {
+        return res.status(400).json({
+          error: 'Invalid token format',
+          message: 'The verification link appears to be corrupted. Please request a new verification email.',
+          details: 'Token should be 64 characters. Received: ' + token.length + ' characters.'
+        });
+      }
+    }
+
+    // Find supplier by verification token
+    let supplier = await prisma.supplier.findFirst({
+      where: {
+        emailVerificationToken: token
+      }
+    });
+
+    console.log('   Supplier found:', supplier ? `Yes (ID: ${supplier.id}, Verified: ${supplier.emailVerified})` : 'No');
+
+    if (!supplier) {
+      console.log('   ❌ No supplier found with this token');
+
+      // Get all suppliers with tokens for debugging
+      const suppliersWithTokens = await prisma.supplier.findMany({
+        where: {
+          emailVerificationToken: {
+            not: null
+          },
+          emailVerified: false
+        },
+        select: {
+          id: true,
+          email: true,
+          emailVerificationToken: true,
+          emailVerificationExpires: true
+        },
+        take: 5 // Limit to 5 for debugging
+      });
+
+      console.log('   Suppliers with unverified tokens:', suppliersWithTokens.length);
+      if (suppliersWithTokens.length > 0) {
+        console.log('   Sample tokens in DB:');
+        suppliersWithTokens.forEach(s => {
+          console.log(`     - ID ${s.id}: ${s.emailVerificationToken?.substring(0, 20)}... (expires: ${s.emailVerificationExpires})`);
+        });
+      }
+
+      return res.status(400).json({
+        error: 'Invalid or expired token',
+        message: 'The verification link is invalid or has expired. Please request a new verification email.',
+        hint: 'If you just registered, please check your email for the latest verification link.'
+      });
+    }
+
+    // Check if token is expired (with 1 hour grace period for email delivery delays)
+    if (supplier.emailVerificationExpires) {
+      const now = new Date();
+      const expiresAt = new Date(supplier.emailVerificationExpires);
+      const gracePeriod = 60 * 60 * 1000; // 1 hour grace period
+      const expiredAt = new Date(expiresAt.getTime() + gracePeriod);
+
+      console.log('   Token expiry check:');
+      console.log(`     Expires at: ${expiresAt.toISOString()}`);
+      console.log(`     Current time: ${now.toISOString()}`);
+      console.log(`     With grace period: ${expiredAt.toISOString()}`);
+
+      if (now > expiredAt) {
+        console.log('   ❌ Token expired (even with grace period)');
+        return res.status(400).json({
+          error: 'Token expired',
+          message: 'The verification link has expired. Please request a new verification email.',
+          hint: 'Verification links expire after 24 hours. Click "Resend Verification Email" to get a new link.'
+        });
+      } else if (now > expiresAt) {
+        console.log('   ⚠️ Token expired but within grace period - allowing verification');
+      } else {
+        console.log('   ✅ Token is valid');
+      }
+    }
+
+    if (supplier.emailVerified) {
+      console.log('   ⚠️ Email already verified, returning existing supplier');
+      // Return success even if already verified
+      const alreadyVerifiedResponse = {
+        ...supplier,
+        id: String(supplier.id)
+      };
+      return res.json({
+        success: true,
+        message: 'Email already verified. You can log in now.',
+        supplier: alreadyVerifiedResponse,
+        redirectUrl: `${process.env.FRONTEND_URL || process.env.VITE_FRONTEND_URL || 'http://localhost:3000'}/supplier?verified=true&email=${encodeURIComponent(supplier.email)}`
+      });
+    }
+
+    // Update supplier to mark email as verified
+    // Use retry logic for Render free tier database connection issues
+    let updatedSupplier = null;
+    let updateAttempts = 0;
+    const MAX_UPDATE_RETRIES = 3;
+
+    console.log('   🔄 Updating email verification status...');
+
+    while (updateAttempts < MAX_UPDATE_RETRIES && !updatedSupplier) {
+      try {
+        updatedSupplier = await prisma.supplier.update({
+          where: { id: supplier.id },
+          data: {
+            emailVerified: true,
+            emailVerificationToken: null,
+            emailVerificationExpires: null
+          },
+          select: {
+            id: true,
+            email: true,
+            fullName: true,
+            emailVerified: true,
+            status: true
+          }
+        });
+        console.log('   ✅ Email verification updated successfully');
+        console.log('      Email verified:', updatedSupplier.emailVerified);
+        break; // Success, exit retry loop
+      } catch (updateError) {
+        updateAttempts++;
+        console.error(`   ❌ Database error updating verification (attempt ${updateAttempts}/${MAX_UPDATE_RETRIES}):`, updateError.message);
+
+        // If it's a connection error and we have retries left, wait and retry
+        if (updateAttempts < MAX_UPDATE_RETRIES && (
+          updateError.message?.includes('connection') ||
+          updateError.message?.includes('timeout') ||
+          updateError.code === 'P1001' ||
+          updateError.code === 'P1017' ||
+          updateError.code === 'P1008'
+        )) {
+          console.log(`   Retrying update in ${updateAttempts * 500}ms...`);
+          await new Promise(resolve => setTimeout(resolve, updateAttempts * 500));
+          continue;
+        }
+        // Not a retryable error, throw
+        throw updateError;
+      }
+    }
+
+    if (!updatedSupplier) {
+      throw new Error('Failed to update email verification after retries');
+    }
+
+    // Send welcome email
+    try {
+      await sendWelcomeEmail(supplier.email, supplier.fullName);
+      console.log(`✅ Welcome email sent to ${supplier.email}`);
+    } catch (emailError) {
+      console.error('❌ Failed to send welcome email:', emailError);
+      // Don't fail verification if welcome email fails
+    }
+
+    // Convert id to string for consistency with frontend
+    const updatedSupplierResponse = {
+      ...updatedSupplier,
+      id: String(updatedSupplier.id)
+    };
+
+    // Redirect URL to supplier login page with verification success message
+    // After verification, user should log in to access the dashboard
+    // Redirect back to registration form at step 5 (license upload) instead of login
+    // Redirect back to registration form at step 5 (license upload)
+    // This ensures users upload their license document before they can login
+    const redirectUrl = `${process.env.FRONTEND_URL || process.env.VITE_FRONTEND_URL || 'http://localhost:3000'}/supplier?register=true&verified=true&email=${encodeURIComponent(updatedSupplier.email)}&supplierId=${updatedSupplier.id}`;
+
+    console.log(`✅ Email verified for supplier ID: ${updatedSupplier.id}`);
+    console.log(`📧 Redirect URL: ${redirectUrl}`);
+
+    res.json({
+      success: true,
+      message: 'Email verified successfully! Please log in to access your supplier dashboard.',
+      supplier: updatedSupplierResponse,
+      redirectUrl: redirectUrl
+    });
+  } catch (error) {
+    console.error('Email verification error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Failed to verify email. Please try again later.',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Get supplier by ID
+app.get('/api/suppliers/:id', async (req, res) => {
+  console.log('═══════════════════════════════════════════════════════════');
+  console.log('📥 BACKEND - GET /api/suppliers/:id');
+  console.log('═══════════════════════════════════════════════════════════');
+  console.log('Request received:', {
+    method: req.method,
+    url: req.url,
+    params: req.params,
+    query: req.query,
+    origin: req.headers.origin,
+    'user-agent': req.headers['user-agent']
+  });
+
+  try {
+    const { id } = req.params;
+    const supplierId = parseInt(id);
+
+    console.log('📥 Supplier ID from params:', {
+      raw: id,
+      parsed: supplierId,
+      isValid: !isNaN(supplierId)
+    });
+
+    if (isNaN(supplierId)) {
+      console.error('❌ BACKEND ERROR: Invalid supplier ID');
+      console.error('   Raw ID:', id);
+      console.error('   Parsed ID:', supplierId);
+      return res.status(400).json({ error: 'Invalid supplier ID' });
+    }
+
+    // Retry logic for Render free tier database connection issues
+    let supplier = null;
+    let findAttempts = 0;
+    const MAX_FIND_RETRIES = 3;
+
+    console.log('🔍 Querying database for supplier...');
+
+    while (findAttempts < MAX_FIND_RETRIES && !supplier) {
+      try {
+        supplier = await prisma.supplier.findUnique({
+          where: { id: supplierId },
+          select: {
+            id: true,
+            email: true,
+            fullName: true,
+            businessType: true,
+            status: true,
+            createdAt: true,
+            companyName: true,
+            mainHub: true,
+            city: true,
+            tourLanguages: true,
+            phone: true,
+            whatsapp: true,
+            emailVerified: true,
+            verificationDocumentUrl: true,
+            certificates: true,
+            paymentMethod: true,
+            paymentMethodDetails: true,
+            paymentCurrency: true,
+            paymentFrequency: true,
+            taxId: true,
+            taxIdType: true,
+            taxCountry: true,
+            taxVerified: true,
+            paymentDetailsVerified: true,
+            paymentDetailsVerifiedAt: true
+          }
+        });
+        console.log('✅ Database query successful');
+        console.log('   Supplier found:', !!supplier);
+        if (supplier) {
+          console.log('   Supplier data:', {
+            id: supplier.id,
+            email: supplier.email,
+            status: supplier.status,
+            fullName: supplier.fullName
+          });
+        }
+        break; // Success, exit retry loop
+      } catch (dbError) {
+        findAttempts++;
+        console.error(`❌ Database error finding supplier (attempt ${findAttempts}/${MAX_FIND_RETRIES}):`, dbError.message);
+        console.error('   Error code:', dbError.code);
+        console.error('   Error name:', dbError.name);
+
+        // If it's a connection error and we have retries left, wait and retry
+        if (findAttempts < MAX_FIND_RETRIES && (
+          dbError.message?.includes('connection') ||
+          dbError.message?.includes('timeout') ||
+          dbError.message?.includes('closed') ||
+          dbError.code === 'P1001' ||
+          dbError.code === 'P1017' ||
+          dbError.code === 'P1008'
+        )) {
+          console.log(`   Retrying in ${findAttempts * 500}ms...`);
+          await new Promise(resolve => setTimeout(resolve, findAttempts * 500));
+          continue;
+        }
+        // Not a retryable error, throw
+        throw dbError;
+      }
+    }
+
+    if (!supplier) {
+      console.error('❌ BACKEND ERROR: Supplier not found');
+      console.error('   Supplier ID:', supplierId);
+      console.error('   Attempts:', findAttempts);
+      console.log('═══════════════════════════════════════════════════════════');
+      return res.status(404).json({ error: 'Supplier not found' });
+    }
+
+    console.log('✅ Sending supplier data to frontend');
+    console.log('═══════════════════════════════════════════════════════════');
+    res.json({ supplier });
+  } catch (error) {
+    console.error('═══════════════════════════════════════════════════════════');
+    console.error('❌ BACKEND ERROR: Get supplier failed');
+    console.error('═══════════════════════════════════════════════════════════');
+    console.error('Error:', error);
+    console.error('Error message:', error.message);
+    console.error('Error stack:', error.stack);
+    console.error('═══════════════════════════════════════════════════════════');
+    res.status(500).json({
+      error: 'Internal server error',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Update supplier profile (fullName, phone, whatsapp)
+app.patch('/api/suppliers/:id/profile', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const supplierId = parseInt(id);
+    const { fullName, phone, whatsapp } = req.body;
+
+    if (isNaN(supplierId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid supplier ID'
+      });
+    }
+
+    // Verify supplier exists
+    const existingSupplier = await prisma.supplier.findUnique({
+      where: { id: supplierId }
+    });
+
+    if (!existingSupplier) {
+      return res.status(404).json({
+        success: false,
+        error: 'Supplier not found'
+      });
+    }
+
+    // Update profile
+    const supplier = await prisma.supplier.update({
+      where: { id: supplierId },
+      data: {
+        ...(fullName !== undefined && { fullName: fullName.trim() || null }),
+        ...(phone !== undefined && { phone: phone || null }),
+        ...(whatsapp !== undefined && { whatsapp: whatsapp || null })
+      },
+      select: {
+        id: true,
+        email: true,
+        fullName: true,
+        phone: true,
+        whatsapp: true
+      }
+    });
+
+    console.log('✅ Supplier profile updated:', supplierId);
+
+    res.json({
+      success: true,
+      message: 'Profile updated successfully',
+      supplier
+    });
+  } catch (error) {
+    console.error('Update profile error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to update profile'
+    });
+  }
+});
+
+// Get all suppliers (admin endpoint)
+app.get('/api/suppliers', async (req, res) => {
+  try {
+    const { status, page = 1, limit = 10 } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const where = status ? { status } : {};
+
+    const [suppliers, total] = await Promise.all([
+      prisma.supplier.findMany({
+        where,
+        skip,
+        take: parseInt(limit),
+        select: {
+          id: true,
+          email: true,
+          fullName: true,
+          businessType: true,
+          status: true,
+          createdAt: true,
+          companyName: true,
+          mainHub: true,
+          city: true,
+          phone: true,
+          whatsapp: true,
+          emailVerified: true,
+          verificationDocumentUrl: true,
+          certificates: true
+        },
+        orderBy: {
+          createdAt: 'desc'
+        }
+      }),
+      prisma.supplier.count({ where })
+    ]);
+
+    res.json({
+      suppliers,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        totalPages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Get suppliers error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Update supplier status (admin endpoint)
+app.patch('/api/suppliers/:id/status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    if (!status || !['pending', 'approved', 'rejected'].includes(status)) {
+      return res.status(400).json({
+        error: 'Invalid status. Must be: pending, approved, or rejected'
+      });
+    }
+
+    const supplier = await prisma.supplier.update({
+      where: { id: parseInt(id) },
+      data: { status },
+      select: {
+        id: true,
+        email: true,
+        fullName: true,
+        status: true,
+        updatedAt: true
+      }
+    });
+
+    res.json({
+      success: true,
+      message: 'Supplier status updated',
+      supplier
+    });
+  } catch (error) {
+    console.error('Update status error:', error);
+    if (error.code === 'P2025') {
+      return res.status(404).json({ error: 'Supplier not found' });
+    }
+    res.status(500).json({
+      error: 'Internal server error',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Resend verification email endpoint
+app.post('/api/suppliers/resend-verification', async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({
+        error: 'Email is required'
+      });
+    }
+
+    const supplier = await prisma.supplier.findUnique({
+      where: { email }
+    });
+
+    if (!supplier) {
+      // Don't reveal if email exists for security
+      return res.json({
+        success: true,
+        message: 'If an account exists with this email, a verification link has been sent.'
+      });
+    }
+
+    if (supplier.emailVerified) {
+      return res.status(400).json({
+        error: 'Email already verified',
+        message: 'This email address has already been verified.'
+      });
+    }
+
+    // Generate new verification token
+    const verificationToken = randomBytes(32).toString('hex');
+    const verificationExpires = new Date();
+    verificationExpires.setHours(verificationExpires.getHours() + 48); // 48 hours expiry
+
+    // Update supplier with new token
+    await prisma.supplier.update({
+      where: { id: supplier.id },
+      data: {
+        emailVerificationToken: verificationToken,
+        emailVerificationExpires: verificationExpires
+      }
+    });
+
+    // Send verification email (try to get language from request, default to 'en')
+    const { language: requestLanguage } = req.body || {};
+    try {
+      await sendVerificationEmail(supplier.email, supplier.fullName, verificationToken, requestLanguage || 'en');
+      console.log(`✅ Verification email resent to ${supplier.email}`);
+    } catch (emailError) {
+      console.error('❌ Failed to resend verification email:', emailError);
+      return res.status(500).json({
+        error: 'Failed to send email',
+        message: 'Could not send verification email. Please try again later.'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Verification email has been sent. Please check your inbox.'
+    });
+  } catch (error) {
+    console.error('Resend verification error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Failed to resend verification email. Please try again later.'
+    });
+  }
+});
+
+// Check email verification status
+app.get('/api/suppliers/:id/verification-status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const supplierId = parseInt(id);
+
+    console.log(`🔍 Checking verification status for supplier ID: ${supplierId}`);
+
+    if (isNaN(supplierId)) {
+      console.log('   ❌ Invalid supplier ID:', id);
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid supplier ID',
+        message: 'Supplier ID must be a valid number'
+      });
+    }
+
+    // Retry logic for Render free tier database connection issues
+    let supplier = null;
+    let findAttempts = 0;
+    const MAX_FIND_RETRIES = 3;
+
+    while (findAttempts < MAX_FIND_RETRIES && !supplier) {
+      try {
+        supplier = await prisma.supplier.findUnique({
+          where: { id: supplierId },
+          select: {
+            id: true,
+            email: true,
+            emailVerified: true,
+            status: true
+          }
+        });
+        break; // Success, exit retry loop
+      } catch (dbError) {
+        findAttempts++;
+        console.error(`   Database error finding supplier (attempt ${findAttempts}/${MAX_FIND_RETRIES}):`, dbError.message);
+
+        // If it's a connection error and we have retries left, wait and retry
+        if (findAttempts < MAX_FIND_RETRIES && (
+          dbError.message?.includes('connection') ||
+          dbError.message?.includes('timeout') ||
+          dbError.code === 'P1001' ||
+          dbError.code === 'P1017' ||
+          dbError.code === 'P1008'
+        )) {
+          console.log(`   Retrying in ${findAttempts * 500}ms...`);
+          await new Promise(resolve => setTimeout(resolve, findAttempts * 500));
+          continue;
+        }
+        // Not a retryable error, break and handle below
+        throw dbError;
+      }
+    }
+
+    if (!supplier) {
+      console.log('   ❌ Supplier not found');
+      return res.status(404).json({
+        success: false,
+        error: 'Supplier not found',
+        message: 'No supplier found with the provided ID'
+      });
+    }
+
+    console.log(`   ✅ Supplier found: ${supplier.email}`);
+    console.log(`   📧 Email verified: ${supplier.emailVerified ? 'YES' : 'NO'}`);
+    console.log(`   📊 Status: ${supplier.status}`);
+
+    res.json({
+      success: true,
+      emailVerified: supplier.emailVerified,
+      status: supplier.status,
+      email: supplier.email // Include email for debugging
+    });
+  } catch (error) {
+    console.error('❌ Verification status check error:', error);
+    console.error('   Error message:', error.message);
+    console.error('   Error code:', error.code);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to check verification status. Please try again.'
+    });
+  }
+});
+
+// Update supplier document
+app.patch('/api/suppliers/:id/update-document', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const supplierId = parseInt(id);
+    const { verificationDocumentUrl, certificates } = req.body;
+
+    console.log('📄 Document upload request received');
+    console.log('   Supplier ID:', supplierId);
+    console.log('   Document URL length:', verificationDocumentUrl ? verificationDocumentUrl.length : 0);
+    console.log('   Certificates:', certificates ? (typeof certificates === 'string' ? JSON.parse(certificates).length : certificates.length) : 0);
+
+    if (isNaN(supplierId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid supplier ID',
+        message: 'Supplier ID must be a valid number'
+      });
+    }
+
+    // Allow updating certificates without license if license already exists
+    if (!verificationDocumentUrl && !existingSupplier.verificationDocumentUrl) {
+      return res.status(400).json({
+        success: false,
+        error: 'Document URL is required',
+        message: 'Please provide a verification document'
+      });
+    }
+
+    // Check if supplier exists
+    const existingSupplier = await prisma.supplier.findUnique({
+      where: { id: supplierId }
+    });
+
+    if (!existingSupplier) {
+      return res.status(404).json({
+        success: false,
+        error: 'Supplier not found',
+        message: 'No supplier found with the provided ID'
+      });
+    }
+
+    // Process license document - upload to R2 if available
+    let finalLicenseUrl = verificationDocumentUrl;
+    if (verificationDocumentUrl && process.env.R2_ACCOUNT_ID && process.env.R2_ACCESS_KEY_ID && process.env.R2_SECRET_ACCESS_KEY) {
+      try {
+        const isPDF = verificationDocumentUrl.startsWith('data:application/pdf');
+        const isImage = verificationDocumentUrl.startsWith('data:image/');
+
+        if (isPDF || isImage) {
+          console.log('☁️  Uploading license document to R2...');
+
+          if (isPDF) {
+            const { uploadDocument } = await import('./utils/r2.js');
+            const base64Data = verificationDocumentUrl.includes(',') ? verificationDocumentUrl.split(',')[1] : verificationDocumentUrl;
+            finalLicenseUrl = await uploadDocument(base64Data, 'globewithlocals/suppliers/licenses', `license_${supplierId}_${Date.now()}`);
+          } else if (isImage) {
+            const { uploadImage } = await import('./utils/r2.js');
+            finalLicenseUrl = await uploadImage(verificationDocumentUrl, 'globewithlocals/suppliers/licenses', `license_${supplierId}_${Date.now()}`);
+          }
+          console.log('✅ License document uploaded to R2');
+        }
+      } catch (err) {
+        console.error('❌ Error uploading license document to R2:', err);
+        // Continue with original URL if R2 upload fails
+      }
+    }
+
+    // Process certificates - upload to R2 if available
+    let finalCertificates = null;
+    if (certificates) {
+      try {
+        const certUrls = typeof certificates === 'string' ? JSON.parse(certificates) : certificates;
+        if (Array.isArray(certUrls) && certUrls.length > 0 && process.env.R2_ACCOUNT_ID && process.env.R2_ACCESS_KEY_ID && process.env.R2_SECRET_ACCESS_KEY) {
+          console.log('☁️  Uploading certificates to R2...');
+          const { uploadImage, uploadDocument } = await import('./utils/r2.js');
+
+          const uploadedCertUrls = await Promise.all(certUrls.map(async (certUrl, index) => {
+            try {
+              const isPDF = certUrl.startsWith('data:application/pdf');
+              const isImage = certUrl.startsWith('data:image/');
+
+              if (isPDF) {
+                const base64Data = certUrl.includes(',') ? certUrl.split(',')[1] : certUrl;
+                return await uploadDocument(base64Data, 'globewithlocals/suppliers/certificates', `cert_${supplierId}_${Date.now()}_${index}`);
+              } else if (isImage) {
+                return await uploadImage(certUrl, 'globewithlocals/suppliers/certificates', `cert_${supplierId}_${Date.now()}_${index}`);
+              }
+              return certUrl; // Fallback to original URL
+            } catch (err) {
+              console.error(`❌ Failed to upload certificate ${index + 1}:`, err);
+              return certUrl; // Fallback to original URL
+            }
+          }));
+
+          finalCertificates = JSON.stringify(uploadedCertUrls);
+          console.log('✅ Certificates uploaded to R2:', uploadedCertUrls.length);
+        } else {
+          finalCertificates = typeof certificates === 'string' ? certificates : JSON.stringify(certificates);
+        }
+      } catch (err) {
+        console.error('❌ Error processing certificates:', err);
+        // Continue with original certificates if processing fails
+        finalCertificates = typeof certificates === 'string' ? certificates : JSON.stringify(certificates);
+      }
+    }
+
+    // Build update data - only update fields that are provided
+    const updateData = {};
+    if (finalLicenseUrl) {
+      updateData.verificationDocumentUrl = finalLicenseUrl;
+      // Reset status to pending when license is updated
+      updateData.status = 'pending';
+    }
+    if (finalCertificates !== null) {
+      updateData.certificates = finalCertificates;
+    }
+
+    const supplier = await prisma.supplier.update({
+      where: { id: supplierId },
+      data: updateData,
+      select: {
+        id: true,
+        email: true,
+        emailVerified: true,
+        status: true,
+        verificationDocumentUrl: true,
+        certificates: true
+      }
+    });
+
+    console.log('✅ Document uploaded successfully for supplier:', supplier.id);
+    console.log('   Status:', supplier.status, '(pending admin approval)');
+    console.log('   Certificates:', supplier.certificates ? (JSON.parse(supplier.certificates).length) : 0);
+
+    res.json({
+      success: true,
+      message: 'Document uploaded successfully',
+      supplier: {
+        ...supplier,
+        id: String(supplier.id)
+      }
+    });
+  } catch (error) {
+    console.error('❌ Document update error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to update document',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// ==================== PAYMENT DETAILS ENDPOINTS ====================
+
+// Get supplier payment details
+app.get('/api/suppliers/:id/payment-details', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const supplierId = parseInt(id);
+
+    if (isNaN(supplierId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid supplier ID'
+      });
+    }
+
+    const supplier = await prisma.supplier.findUnique({
+      where: { id: supplierId },
+      select: {
+        id: true,
+        paymentMethod: true,
+        paymentMethodDetails: true,
+        paymentCurrency: true,
+        paymentFrequency: true,
+        taxId: true,
+        taxIdType: true,
+        taxCountry: true,
+        taxVerified: true,
+        paymentDetailsVerified: true,
+        paymentDetailsVerifiedAt: true
+      }
+    });
+
+    if (!supplier) {
+      return res.status(404).json({
+        success: false,
+        error: 'Supplier not found'
+      });
+    }
+
+    // Parse payment method details if exists
+    let paymentDetails = null;
+    if (supplier.paymentMethodDetails) {
+      try {
+        paymentDetails = typeof supplier.paymentMethodDetails === 'string'
+          ? JSON.parse(supplier.paymentMethodDetails)
+          : supplier.paymentMethodDetails;
+      } catch (e) {
+        console.error('Error parsing paymentMethodDetails:', e);
+      }
+    }
+
+    res.json({
+      success: true,
+      paymentDetails: {
+        paymentMethod: supplier.paymentMethod,
+        paymentMethodDetails: paymentDetails,
+        paymentCurrency: supplier.paymentCurrency,
+        paymentFrequency: supplier.paymentFrequency || 'monthly',
+        taxId: supplier.taxId,
+        taxIdType: supplier.taxIdType,
+        taxCountry: supplier.taxCountry,
+        taxVerified: supplier.taxVerified,
+        paymentDetailsVerified: supplier.paymentDetailsVerified,
+        paymentDetailsVerifiedAt: supplier.paymentDetailsVerifiedAt
+      }
+    });
+  } catch (error) {
+    console.error('Get payment details error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to fetch payment details'
+    });
+  }
+});
+
+// Update supplier payment details
+app.put('/api/suppliers/:id/payment-details', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const supplierId = parseInt(id);
+    const {
+      paymentMethod,
+      paymentMethodDetails,
+      paymentCurrency,
+      paymentFrequency,
+      taxId,
+      taxIdType,
+      taxCountry
+    } = req.body;
+
+    if (isNaN(supplierId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid supplier ID'
+      });
+    }
+
+    // Check if supplier exists
+    const existingSupplier = await prisma.supplier.findUnique({
+      where: { id: supplierId }
+    });
+
+    if (!existingSupplier) {
+      return res.status(404).json({
+        success: false,
+        error: 'Supplier not found'
+      });
+    }
+
+    // Validate payment method
+    const validPaymentMethods = ['bank_transfer', 'paypal', 'credit_card', 'upi', 'wise'];
+    if (paymentMethod && !validPaymentMethods.includes(paymentMethod)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid payment method',
+        message: `Payment method must be one of: ${validPaymentMethods.join(', ')}`
+      });
+    }
+
+    // Validate and sanitize payment method details
+    let sanitizedPaymentDetails = null;
+    if (paymentMethodDetails) {
+      try {
+        const details = typeof paymentMethodDetails === 'string'
+          ? JSON.parse(paymentMethodDetails)
+          : paymentMethodDetails;
+
+        // Sanitize sensitive data - mask account numbers, card numbers
+        if (details.accountNumber && details.accountNumber.length > 4) {
+          const last4 = details.accountNumber.slice(-4);
+          details.accountNumber = `******${last4}`;
+        }
+        if (details.cardNumber && details.cardNumber.length > 4) {
+          const last4 = details.cardNumber.slice(-4);
+          details.cardNumber = `******${last4}`;
+        }
+
+        sanitizedPaymentDetails = JSON.stringify(details);
+      } catch (e) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid payment method details format',
+          message: 'Payment method details must be valid JSON'
+        });
+      }
+    }
+
+    // Validate payment frequency
+    if (paymentFrequency && !['monthly', 'biweekly'].includes(paymentFrequency)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid payment frequency',
+        message: 'Payment frequency must be "monthly" or "biweekly"'
+      });
+    }
+
+    // Update supplier payment details
+    const updatedSupplier = await prisma.supplier.update({
+      where: { id: supplierId },
+      data: {
+        paymentMethod: paymentMethod || null,
+        paymentMethodDetails: sanitizedPaymentDetails,
+        paymentCurrency: paymentCurrency || null,
+        paymentFrequency: paymentFrequency || 'monthly',
+        taxId: taxId || null,
+        taxIdType: taxIdType || null,
+        taxCountry: taxCountry || null,
+        paymentDetailsVerified: false // Reset verification when details are updated
+      },
+      select: {
+        id: true,
+        paymentMethod: true,
+        paymentMethodDetails: true,
+        paymentCurrency: true,
+        paymentFrequency: true,
+        taxId: true,
+        taxIdType: true,
+        taxCountry: true,
+        paymentDetailsVerified: true
+      }
+    });
+
+    // Parse payment details for response
+    let paymentDetails = null;
+    if (updatedSupplier.paymentMethodDetails) {
+      try {
+        paymentDetails = JSON.parse(updatedSupplier.paymentMethodDetails);
+      } catch (e) {
+        console.error('Error parsing paymentMethodDetails:', e);
+      }
+    }
+
+    res.json({
+      success: true,
+      message: 'Payment details updated successfully',
+      paymentDetails: {
+        paymentMethod: updatedSupplier.paymentMethod,
+        paymentMethodDetails: paymentDetails,
+        paymentCurrency: updatedSupplier.paymentCurrency,
+        paymentFrequency: updatedSupplier.paymentFrequency,
+        taxId: updatedSupplier.taxId,
+        taxIdType: updatedSupplier.taxIdType,
+        taxCountry: updatedSupplier.taxCountry,
+        paymentDetailsVerified: updatedSupplier.paymentDetailsVerified
+      }
+    });
+  } catch (error) {
+    console.error('Update payment details error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to update payment details'
+    });
+  }
+});
+
+// Helper function to calculate TDS (Tax Deducted at Source)
+// Simplified: 5% TDS for Indian suppliers without verified GSTIN, 0% otherwise
+function calculateTDS(grossEarnings, taxCountry, taxVerified) {
+  if (taxCountry === 'India' && !taxVerified) {
+    return grossEarnings * 0.05; // 5% TDS
+  }
+  return 0;
+}
+
+// Get supplier earnings summary
+app.get('/api/suppliers/:id/earnings', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const supplierId = parseInt(id);
+
+    if (isNaN(supplierId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid supplier ID'
+      });
+    }
+
+    // Get supplier tax details
+    const supplier = await prisma.supplier.findUnique({
+      where: { id: supplierId },
+      select: {
+        taxCountry: true,
+        taxVerified: true
+      }
+    });
+
+    // Get all bookings for this supplier
+    const bookings = await prisma.booking.findMany({
+      where: { supplierId },
+      select: {
+        id: true,
+        totalAmount: true,
+        currency: true,
+        status: true,
+        paymentStatus: true,
+        createdAt: true,
+        tour: {
+          select: {
+            title: true
+          }
+        }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    // Calculate earnings (70% to supplier, 30% platform commission)
+    const commissionRate = 0.30;
+    const supplierRate = 0.70;
+
+    const completedBookings = bookings.filter(b => b.status === 'completed' && b.paymentStatus === 'paid');
+    const pendingBookings = bookings.filter(b => b.status === 'confirmed' && b.paymentStatus === 'paid');
+
+    const grossEarnings = completedBookings.reduce((sum, b) => sum + (b.totalAmount * supplierRate), 0);
+    const pendingEarnings = pendingBookings.reduce((sum, b) => sum + (b.totalAmount * supplierRate), 0);
+
+    // Calculate TDS (Tax Deducted at Source)
+    const tdsDeducted = calculateTDS(grossEarnings, supplier?.taxCountry || null, supplier?.taxVerified || false);
+    const netEarnings = grossEarnings - tdsDeducted;
+
+    // Calculate this month's earnings
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const thisMonthBookings = completedBookings.filter(b => {
+      const bookingDate = new Date(b.createdAt);
+      return bookingDate >= startOfMonth;
+    });
+    const thisMonthGrossEarnings = thisMonthBookings.reduce((sum, b) => sum + (b.totalAmount * supplierRate), 0);
+    const thisMonthTDS = calculateTDS(thisMonthGrossEarnings, supplier?.taxCountry || null, supplier?.taxVerified || false);
+    const thisMonthEarnings = thisMonthGrossEarnings - thisMonthTDS;
+
+    // Calculate next payout date (5th of next month)
+    const nextPayoutDate = new Date(now.getFullYear(), now.getMonth() + 1, 5);
+    // If 5th is weekend, move to next business day
+    while (nextPayoutDate.getDay() === 0 || nextPayoutDate.getDay() === 6) {
+      nextPayoutDate.setDate(nextPayoutDate.getDate() + 1);
+    }
+
+    res.json({
+      success: true,
+      earnings: {
+        grossEarnings: grossEarnings,
+        tdsDeducted: tdsDeducted,
+        netEarnings: netEarnings,
+        totalEarnings: netEarnings, // For backward compatibility
+        thisMonthGrossEarnings: thisMonthGrossEarnings,
+        thisMonthTDS: thisMonthTDS,
+        thisMonthEarnings: thisMonthEarnings,
+        pendingEarnings: pendingEarnings,
+        nextPayoutDate: nextPayoutDate.toISOString(),
+        paymentFrequency: 'monthly',
+        commissionRate: commissionRate,
+        supplierRate: supplierRate,
+        totalBookings: bookings.length,
+        completedBookings: completedBookings.length,
+        pendingBookings: pendingBookings.length
+      },
+      bookings: bookings.map(b => ({
+        id: b.id,
+        tourTitle: b.tour.title,
+        amount: b.totalAmount,
+        supplierAmount: b.totalAmount * supplierRate,
+        currency: b.currency,
+        status: b.status,
+        paymentStatus: b.paymentStatus,
+        createdAt: b.createdAt
+      }))
+    });
+  } catch (error) {
+    console.error('Get earnings error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to fetch earnings'
+    });
+  }
+});
+
+// ==================== TOUR ENDPOINTS ====================
+
+// Helper function to safely format tour response - ensures reviews is always null
+// This prevents "reviews is not defined" errors and ensures consistency
+function formatTourResponse(tour, parsedData = {}) {
+  // Parse groupPricingTiers from Tour model (PRIMARY SOURCE)
+  let tourGroupPricingTiers = null;
+
+
+
+  if (tour.groupPricingTiers) {
+    try {
+      tourGroupPricingTiers = typeof tour.groupPricingTiers === 'string'
+        ? JSON.parse(tour.groupPricingTiers)
+        : tour.groupPricingTiers;
+      console.log(`✅ formatTourResponse - Tour ${tour.id} has groupPricingTiers:`, {
+        type: Array.isArray(tourGroupPricingTiers) ? 'array' : typeof tourGroupPricingTiers,
+        length: Array.isArray(tourGroupPricingTiers) ? tourGroupPricingTiers.length : 'N/A'
+      });
+
+    } catch (e) {
+      console.error(`❌ Failed to parse tour.groupPricingTiers for tour ${tour.id}:`, e.message);
+
+    }
+  } else {
+    console.warn(`⚠️ Tour ${tour.id} has NO groupPricingTiers on Tour model`);
+
+  }
+
+  // Parse itineraryItems from database JSON string
+  let parsedItineraryItems = null;
+  if (tour.itineraryItems) {
+    try {
+      parsedItineraryItems = typeof tour.itineraryItems === 'string'
+        ? JSON.parse(tour.itineraryItems)
+        : tour.itineraryItems;
+    } catch (e) {
+      console.error(`❌ Failed to parse itineraryItems for tour ${tour.id}:`, e.message);
+    }
+  }
+
+  return {
+    ...tour,
+    id: String(tour.id),
+    locations: parsedData.locations || JSON.parse(tour.locations || '[]'),
+    images: parsedData.images || JSON.parse(tour.images || '[]'),
+    languages: parsedData.languages || JSON.parse(tour.languages || '[]'),
+    highlights: parsedData.highlights || (tour.highlights ? JSON.parse(tour.highlights || '[]') : []),
+    reviews: null, // Always null - reviews are not generated
+    itineraryItems: parsedItineraryItems,
+    groupPricingTiers: tourGroupPricingTiers, // PRIMARY SOURCE - from Tour model
+    options: tour.options && Array.isArray(tour.options) ? tour.options.map(opt => {
+      // Explicitly exclude pricingType if it somehow exists
+      const { pricingType, pricing_type, ...cleanOpt } = opt;
+
+      // Parse groupPricingTiers if it exists (stored as JSON string in DB)
+      let groupPricingTiers = null;
+      console.log(`🔍 formatTourResponse - Option ${opt.id} (${opt.optionTitle}):`, {
+        hasGroupPricingTiers: !!opt.groupPricingTiers,
+        groupPricingTiersType: typeof opt.groupPricingTiers,
+        groupPricingTiersRaw: opt.groupPricingTiers
+          ? (typeof opt.groupPricingTiers === 'string'
+            ? opt.groupPricingTiers.substring(0, 200)
+            : JSON.stringify(opt.groupPricingTiers).substring(0, 200))
+          : 'null',
+        allKeys: Object.keys(opt)
+      });
+
+      if (opt.groupPricingTiers) {
+        try {
+          groupPricingTiers = typeof opt.groupPricingTiers === 'string'
+            ? JSON.parse(opt.groupPricingTiers)
+            : opt.groupPricingTiers;
+          console.log(`✅ Parsed groupPricingTiers for option ${opt.id}:`, {
+            type: Array.isArray(groupPricingTiers) ? 'array' : typeof groupPricingTiers,
+            length: Array.isArray(groupPricingTiers) ? groupPricingTiers.length : 'N/A',
+            preview: Array.isArray(groupPricingTiers) && groupPricingTiers.length > 0
+              ? groupPricingTiers[0]
+              : groupPricingTiers
+          });
+        } catch (e) {
+          console.error(`❌ Failed to parse groupPricingTiers for option ${opt.id}:`, e.message);
+          console.error('   Raw value:', opt.groupPricingTiers);
+          groupPricingTiers = null;
+        }
+      } else {
+        console.warn(`⚠️ Option ${opt.id} has NO groupPricingTiers in database`);
+      }
+
+      return {
+        ...cleanOpt,
+        id: String(opt.id),
+        tourId: String(opt.tourId),
+        groupPricingTiers: groupPricingTiers
+      };
+    }) : []
+  };
+}
+
+// Generate believable fake reviews for a tour (DEPRECATED - not used anymore)
+function generateFakeReviews(tourData) {
+  const { title, city = 'the city', country = 'the country', category = 'Guided Tour', locations, duration, fullDescription, guideType, supplier } = tourData;
+
+  // Extract location names from locations array
+  const locationsArray = Array.isArray(locations) ? locations : (typeof locations === 'string' ? JSON.parse(locations || '[]') : []);
+  const locationNames = Array.isArray(locationsArray) && locationsArray.length > 0
+    ? locationsArray.map(loc => typeof loc === 'string' ? loc : loc.name || loc).join(', ')
+    : (city || 'the location');
+
+  // Generate review templates based on tour type
+  const reviewTemplates = [];
+
+  // Country-specific names for smarter reviews
+  const getNamePool = (country) => {
+    const countryLower = country.toLowerCase();
+
+    if (countryLower.includes('china') || countryLower.includes('chinese')) {
+      return {
+        firstNames: ['Wei', 'Li', 'Zhang', 'Wang', 'Liu', 'Chen', 'Yang', 'Huang', 'Zhao', 'Wu', 'Zhou', 'Xu', 'Sun', 'Ma', 'Zhu', 'Hu', 'Guo', 'He', 'Gao', 'Lin', 'Luo', 'Song', 'Zheng', 'Liang', 'Xie', 'Tang', 'Han', 'Cao', 'Feng', 'Cheng'],
+        lastNames: ['Wang', 'Li', 'Zhang', 'Liu', 'Chen', 'Yang', 'Huang', 'Zhao', 'Wu', 'Zhou', 'Xu', 'Sun', 'Ma', 'Zhu', 'Hu', 'Guo', 'He', 'Gao', 'Lin', 'Luo'],
+        countries: ['China', 'Hong Kong', 'Taiwan', 'Singapore', 'Malaysia', 'United States', 'Canada', 'Australia', 'United Kingdom']
+      };
+    }
+
+    if (countryLower.includes('japan') || countryLower.includes('japanese')) {
+      return {
+        firstNames: ['Hiroshi', 'Yuki', 'Sakura', 'Takeshi', 'Aiko', 'Kenji', 'Emiko', 'Ryota', 'Yuki', 'Mei', 'Daiki', 'Haruka', 'Kenta', 'Akari', 'Sota', 'Rina', 'Yuto', 'Miyuki', 'Shota', 'Yui', 'Ren', 'Hana', 'Kaito', 'Mika', 'Ryo', 'Aya', 'Taro', 'Naomi', 'Koji', 'Sayaka'],
+        lastNames: ['Tanaka', 'Sato', 'Suzuki', 'Takahashi', 'Watanabe', 'Ito', 'Yamamoto', 'Nakamura', 'Kobayashi', 'Kato', 'Yoshida', 'Yamada', 'Sasaki', 'Yamaguchi', 'Saito', 'Matsumoto', 'Inoue', 'Kimura', 'Hayashi', 'Shimizu'],
+        countries: ['Japan', 'United States', 'Australia', 'United Kingdom', 'Canada', 'Singapore', 'South Korea']
+      };
+    }
+
+    if (countryLower.includes('india') || countryLower.includes('indian')) {
+      return {
+        firstNames: ['Priya', 'Raj', 'Anjali', 'Arjun', 'Kavya', 'Vikram', 'Meera', 'Rohan', 'Sneha', 'Aryan', 'Divya', 'Karan', 'Pooja', 'Rahul', 'Neha', 'Aditya', 'Shreya', 'Vishal', 'Ananya', 'Siddharth', 'Isha', 'Ravi', 'Kriti', 'Nikhil', 'Tanvi', 'Aman', 'Riya', 'Kunal', 'Aishwarya', 'Varun'],
+        lastNames: ['Sharma', 'Patel', 'Singh', 'Kumar', 'Gupta', 'Reddy', 'Mehta', 'Joshi', 'Verma', 'Agarwal', 'Malhotra', 'Chopra', 'Kapoor', 'Shah', 'Rao', 'Nair', 'Iyer', 'Menon', 'Pillai', 'Krishnan'],
+        countries: ['India', 'United States', 'United Kingdom', 'Canada', 'Australia', 'Singapore', 'UAE']
+      };
+    }
+
+    if (countryLower.includes('korea') || countryLower.includes('korean')) {
+      return {
+        firstNames: ['Min-jun', 'So-young', 'Ji-hoon', 'Hae-won', 'Seung-min', 'Ji-eun', 'Hyun-woo', 'Ye-jin', 'Jun-seo', 'Soo-jin', 'Tae-hyun', 'Min-ji', 'Jin-woo', 'Eun-ji', 'Dong-hyun', 'Hye-jin', 'Sang-min', 'Ji-woo', 'Min-seo', 'Hyun-jin'],
+        lastNames: ['Kim', 'Lee', 'Park', 'Choi', 'Jung', 'Kang', 'Cho', 'Yoon', 'Jang', 'Lim', 'Shin', 'Han', 'Oh', 'Song', 'Moon', 'Kwon', 'Hwang', 'Ahn', 'Yoo', 'Bae'],
+        countries: ['South Korea', 'United States', 'Canada', 'Australia', 'Japan', 'China']
+      };
+    }
+
+    if (countryLower.includes('thailand') || countryLower.includes('thai')) {
+      return {
+        firstNames: ['Siri', 'Niran', 'Pim', 'Chai', 'Naree', 'Somchai', 'Wanida', 'Anan', 'Supaporn', 'Prasert', 'Siriporn', 'Somsak', 'Kanya', 'Suthep', 'Nonglak', 'Wichai', 'Pornthip', 'Sakchai', 'Jintana', 'Narong'],
+        lastNames: ['Srisawat', 'Chaiyawat', 'Prasert', 'Sukhum', 'Thongchai', 'Wongsa', 'Srisuwan', 'Chaiyaporn', 'Prasert', 'Sukhumvit', 'Thongchai', 'Wongsa', 'Srisuwan', 'Chaiyaporn', 'Prasert', 'Sukhum', 'Thongchai', 'Wongsa', 'Srisuwan', 'Chaiyaporn'],
+        countries: ['Thailand', 'United States', 'United Kingdom', 'Australia', 'Singapore', 'Malaysia']
+      };
+    }
+
+    // Default: Western names
+    return {
+      firstNames: ['Sarah', 'Michael', 'Emma', 'James', 'Olivia', 'David', 'Sophia', 'Robert', 'Isabella', 'William', 'Mia', 'Richard', 'Emily', 'Joseph', 'Charlotte', 'Thomas', 'Amelia', 'Charles', 'Harper', 'Daniel', 'Evelyn', 'Matthew', 'Abigail', 'Anthony', 'Elizabeth', 'Mark', 'Sofia', 'Donald', 'Avery', 'Steven', 'Ella', 'Paul', 'Madison', 'Andrew', 'Scarlett', 'Joshua', 'Victoria', 'Kenneth', 'Aria', 'Kevin', 'Grace', 'Brian', 'Chloe', 'George', 'Penelope', 'Edward', 'Riley', 'Ronald', 'Layla', 'Timothy'],
+      lastNames: ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis', 'Rodriguez', 'Martinez', 'Hernandez', 'Lopez', 'Wilson', 'Anderson', 'Thomas', 'Taylor', 'Moore', 'Jackson', 'Martin', 'Lee', 'Thompson', 'White', 'Harris', 'Sanchez', 'Clark', 'Ramirez', 'Lewis', 'Robinson', 'Walker', 'Young', 'Allen', 'King', 'Wright', 'Scott', 'Torres', 'Nguyen', 'Hill', 'Flores', 'Green', 'Adams', 'Nelson', 'Baker', 'Hall', 'Rivera', 'Campbell', 'Mitchell', 'Carter', 'Roberts'],
+      countries: ['United States', 'United Kingdom', 'Canada', 'Australia', 'Germany', 'France', 'Spain', 'Italy', 'Netherlands', 'Sweden', 'Norway', 'Denmark', 'Switzerland', 'Belgium', 'Ireland', 'New Zealand', 'Singapore', 'Brazil', 'Mexico', 'Argentina', 'Chile', 'South Africa']
+    };
+  };
+
+  const namePool = getNamePool(country);
+  const firstNames = namePool.firstNames;
+  const lastNames = namePool.lastNames;
+  const countries = namePool.countries;
+
+  // Review templates based on tour category - more varied and smarter
+  const categoryTemplates = {
+    'Guided Tour': [
+      `Our guide was absolutely fantastic! Very knowledgeable about ${locationNames || city} and made the experience truly memorable.`,
+      `Highly recommend this tour! The guide was friendly, professional, and shared so many interesting stories about ${locationNames || city}.`,
+      `Amazing experience! The guide knew all the best spots and timing. We learned so much about the history and culture.`,
+      `Perfect tour for first-time visitors to ${city}. The guide was patient, answered all our questions, and made us feel comfortable.`,
+      `The guide was excellent - spoke perfect English and had great insights. We saw everything we wanted and more!`,
+      `One of the best tours we've taken! The guide was passionate about ${city} and it showed. Highly professional.`,
+      `Great value for money! The guide was knowledgeable and the tour was well-organized. Would definitely book again.`,
+      `The guide made this tour special. Very informative and friendly. We got amazing photos and learned a lot about ${locationNames || city}.`,
+      `What an incredible experience! The guide's expertise really enhanced our understanding of ${city}'s rich history.`,
+      `We were blown away by how much we learned. The guide had fascinating insights about every place we visited.`,
+      `This tour exceeded all expectations! The guide was engaging, knowledgeable, and made history come alive.`,
+      `Perfect balance of information and exploration. The guide knew exactly when to share details and when to let us explore.`,
+      `The guide's storytelling made this tour unforgettable. We felt like we were experiencing ${city} through a local's eyes.`,
+      `Outstanding tour! The guide was professional, personable, and clearly loves sharing ${city}'s culture with visitors.`,
+      `We couldn't have asked for a better introduction to ${city}. The guide made us feel welcome and excited to explore more.`,
+      `The guide's knowledge was impressive, but what really stood out was their enthusiasm and genuine care for our experience.`
+    ],
+    'Entry Ticket': [
+      `Smooth entry process! The skip-the-line ticket saved us so much time. Highly recommend for ${locationNames || city}.`,
+      `Great experience! Easy to use ticket and no waiting in long queues. Perfect for visiting ${locationNames || city}.`,
+      `Worth every penny! The entry was seamless and we had plenty of time to explore ${locationNames || city} at our own pace.`,
+      `Very convenient! The ticket was easy to redeem and we avoided the long lines. Great way to visit ${locationNames || city}.`,
+      `Excellent service! Quick entry and the ticket included everything promised. Made our visit to ${locationNames || city} stress-free.`,
+      `Perfect for a hassle-free visit! The ticket worked perfectly and we had a wonderful time exploring ${locationNames || city}.`,
+      `Highly recommend! The entry process was smooth and we had a great time at ${locationNames || city}.`,
+      `Great value! Easy booking and entry. We enjoyed our visit to ${locationNames || city} without any issues.`,
+      `The skip-the-line feature was a game-changer! We spent more time exploring and less time waiting.`,
+      `Booking was straightforward and the entry was even easier. No complications at all!`,
+      `We appreciated the flexibility - the ticket was valid for the whole day, so we could explore at our own pace.`,
+      `The digital ticket made everything so simple. Just showed it on our phone and we were in!`,
+      `Great value compared to buying tickets at the gate. Plus, we saved time by skipping the queue.`,
+      `Everything was exactly as described. The ticket gave us access to all the areas we wanted to see.`,
+      `We'll definitely use this service again. The convenience alone was worth it!`
+    ],
+    'Mini Tour': [
+      `Perfect short tour! Great way to see ${locationNames || city} without spending the whole day. Highly recommend!`,
+      `Amazing mini tour experience! We covered all the highlights in a short time. The guide was excellent and very informative.`,
+      `Great value for a quick tour! Perfect for travelers with limited time. We learned so much about ${city} in just a few hours.`,
+      `Excellent mini tour! Well-organized and informative. The guide was friendly and made the experience enjoyable.`,
+      `Perfect introduction to ${city}! This mini tour gave us a great overview. Would definitely recommend to others.`,
+      `Wonderful experience! Short but comprehensive tour of ${locationNames || city}. The guide was knowledgeable and engaging.`,
+      `Great mini tour! We saw all the key attractions and learned about the history. Perfect for first-time visitors.`,
+      `Highly recommend this mini tour! Great way to explore ${city} without feeling rushed. Excellent guide and organization.`,
+      `Perfect for a quick city overview! We got to see the main sights without committing to a full-day tour.`,
+      `The mini tour format was ideal for us. We learned a lot in a short time and still had the rest of the day free.`,
+      `Great introduction to ${city}! The tour was concise but packed with interesting information.`,
+      `We loved how efficient this tour was. Covered all the highlights without dragging on.`,
+      `Perfect balance of information and time. The guide made sure we saw everything important without rushing.`,
+      `This mini tour was exactly what we needed - informative, well-paced, and perfect for our schedule.`,
+      `Great way to get oriented in ${city}! The tour gave us confidence to explore more on our own afterward.`
+    ]
+  };
+
+  const templates = categoryTemplates[category] || categoryTemplates['Guided Tour'];
+
+  // Generate 10-99 reviews
+  const numReviews = Math.floor(Math.random() * 90) + 10; // 10-99 reviews
+
+  // Calculate target average rating (between 4.0 and 4.8)
+  const targetAverage = 4.0 + (Math.random() * 0.8); // Random between 4.0 and 4.8
+
+  // Pre-calculate rating distribution to achieve target average
+  // Formula: targetAverage = (3*x + 4*y + 5*z) / (x + y + z)
+  // Where x = count of 3s, y = count of 4s, z = count of 5s
+  let count3 = 0, count4 = 0, count5 = 0;
+
+  if (targetAverage >= 4.6) {
+    // High average (4.6-4.8): mostly 5s, some 4s, very few 3s
+    count5 = Math.floor(numReviews * 0.75);
+    count4 = Math.floor(numReviews * 0.20);
+    count3 = numReviews - count5 - count4;
+  } else if (targetAverage >= 4.4) {
+    // Medium-high average (4.4-4.6): mix of 4s and 5s, few 3s
+    count5 = Math.floor(numReviews * 0.55);
+    count4 = Math.floor(numReviews * 0.35);
+    count3 = numReviews - count5 - count4;
+  } else if (targetAverage >= 4.2) {
+    // Medium average (4.2-4.4): balanced mix
+    count5 = Math.floor(numReviews * 0.35);
+    count4 = Math.floor(numReviews * 0.50);
+    count3 = numReviews - count5 - count4;
+  } else {
+    // Lower average (4.0-4.2): more 4s, some 3s and 5s
+    count5 = Math.floor(numReviews * 0.20);
+    count4 = Math.floor(numReviews * 0.60);
+    count3 = numReviews - count5 - count4;
+  }
+
+  // Create arrays of ratings
+  const ratings = [
+    ...Array(count3).fill(3),
+    ...Array(count4).fill(4),
+    ...Array(count5).fill(5)
+  ];
+
+  // Shuffle ratings for randomness
+  for (let i = ratings.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [ratings[i], ratings[j]] = [ratings[j], ratings[i]];
+  }
+
+  const reviews = [];
+
+  // Use tour title + timestamp as seed for more variation
+  const seed = title + Date.now();
+  let seedValue = 0;
+  for (let i = 0; i < seed.length; i++) {
+    seedValue = ((seedValue << 5) - seedValue) + seed.charCodeAt(i);
+    seedValue = seedValue & seedValue;
+  }
+
+  // Simple seeded random function for more variation
+  let seedCounter = seedValue;
+  const seededRandom = () => {
+    seedCounter = (seedCounter * 9301 + 49297) % 233280;
+    return seedCounter / 233280;
+  };
+
+  for (let i = 0; i < numReviews; i++) {
+    // Mix Math.random() with seeded random for better variation - different for each selection
+    const random1 = (Math.random() + seededRandom()) / 2;
+    const random2 = (Math.random() + seededRandom()) / 2;
+    const random3 = (Math.random() + seededRandom()) / 2;
+    const random4 = (Math.random() + seededRandom()) / 2;
+
+    // Ensure mix of locals and foreigners (40-60% foreigners)
+    const isForeigner = Math.random() < 0.55; // 55% chance of being foreigner
+
+    let firstName, lastName, countryName;
+
+    if (isForeigner) {
+      // Use foreign names (Western names pool)
+      const foreignFirstNames = ['Sarah', 'Michael', 'Emma', 'James', 'Olivia', 'David', 'Sophia', 'Robert', 'Isabella', 'William', 'Mia', 'Richard', 'Emily', 'Joseph', 'Charlotte', 'Thomas', 'Amelia', 'Charles', 'Harper', 'Daniel', 'Evelyn', 'Matthew', 'Abigail', 'Anthony', 'Elizabeth', 'Mark', 'Sofia', 'Donald', 'Avery', 'Steven', 'Ella', 'Paul', 'Madison', 'Andrew', 'Scarlett', 'Joshua', 'Victoria', 'Kenneth', 'Aria', 'Kevin', 'Grace', 'Brian', 'Chloe', 'George', 'Penelope', 'Edward', 'Riley', 'Ronald', 'Layla', 'Timothy', 'Maria', 'Carlos', 'Anna', 'Hans', 'Pierre', 'Giulia', 'Yuki', 'Lucas', 'Sophie', 'Marco', 'Emma', 'Liam', 'Noah', 'Oliver', 'Ava', 'Isabella', 'Mia', 'Charlotte', 'Amelia', 'Harper', 'Evelyn', 'Abigail', 'Emily', 'Elizabeth', 'Mila', 'Ella', 'Avery', 'Sofia', 'Camila', 'Aria', 'Scarlett', 'Victoria', 'Madison', 'Luna', 'Grace', 'Chloe', 'Penelope', 'Layla', 'Riley', 'Zoey', 'Nora', 'Lily', 'Eleanor', 'Hannah', 'Lillian', 'Addison', 'Aubrey', 'Ellie', 'Stella', 'Natalie', 'Zoe', 'Leah', 'Hazel', 'Violet', 'Aurora', 'Savannah', 'Audrey', 'Brooklyn', 'Bella', 'Claire', 'Skylar', 'Lucy', 'Paisley', 'Everly', 'Anna', 'Caroline', 'Nova', 'Genesis', 'Aaliyah', 'Kennedy', 'Kinsley', 'Allison', 'Maya', 'Sarah', 'Ariana', 'Allison', 'Gabriella', 'Alice', 'Madelyn', 'Cora', 'Ruby', 'Eva', 'Serenity', 'Autumn', 'Adeline', 'Hailey', 'Gianna', 'Valentina', 'Isla', 'Eliana', 'Quinn', 'Nevaeh', 'Ivy', 'Sadie', 'Piper', 'Lydia', 'Alexa', 'Josephine', 'Emilia', 'Gianna', 'Arianna', 'Lucy', 'Arielle', 'Peyton', 'Makayla', 'Melanie', 'Mackenzie', 'Naomi', 'Faith', 'Liliana', 'Katherine', 'Jocelyn', 'Stella', 'Brianna', 'Maya', 'Skylar', 'Alexis', 'Natalia', 'Alyssa', 'Ariana', 'Isabelle', 'Savannah', 'Valeria', 'Annabelle', 'Lucia', 'Ximena', 'Liliana', 'Alessandra', 'Myah', 'Melissa', 'Nicole', 'Amanda', 'Kaylee', 'Andrea', 'Kimberly', 'Brianna', 'Destiny', 'Maria', 'Vanessa', 'Brooke', 'Samantha', 'Stephanie', 'Rachel', 'Jennifer', 'Michelle', 'Jessica', 'Ashley', 'Amanda', 'Melissa', 'Deborah', 'Lisa', 'Nancy', 'Betty', 'Margaret', 'Sandra', 'Ashley', 'Kimberly', 'Emily', 'Donna', 'Michelle', 'Carol', 'Amanda', 'Dorothy', 'Melissa', 'Deborah', 'Stephanie', 'Rebecca', 'Sharon', 'Laura', 'Cynthia', 'Kathleen', 'Amy', 'Angela', 'Shirley', 'Anna', 'Brenda', 'Pamela', 'Emma', 'Nicole', 'Helen', 'Samantha', 'Katherine', 'Christine', 'Debra', 'Rachel', 'Carolyn', 'Janet', 'Virginia', 'Maria', 'Heather', 'Diane', 'Julie', 'Joyce', 'Victoria', 'Kelly', 'Christina', 'Joan', 'Evelyn', 'Lauren', 'Judith', 'Megan', 'Cheryl', 'Andrea', 'Hannah', 'Jacqueline', 'Martha', 'Gloria', 'Teresa', 'Sara', 'Janice', 'Marie', 'Julia', 'Grace', 'Judy', 'Theresa', 'Madison', 'Beverly', 'Denise', 'Marilyn', 'Amber', 'Danielle', 'Brittany', 'Diana', 'Abigail', 'Jane', 'Lori', 'Tammy', 'Marilyn', 'Kathy', 'Nicole', 'Christine', 'Samantha', 'Deborah', 'Rachel', 'Carolyn', 'Janet', 'Virginia', 'Maria', 'Heather', 'Diane', 'Julie', 'Joyce', 'Victoria', 'Kelly', 'Christina', 'Joan', 'Evelyn', 'Lauren', 'Judith', 'Megan', 'Cheryl', 'Andrea', 'Hannah', 'Jacqueline', 'Martha', 'Gloria', 'Teresa', 'Sara', 'Janice', 'Marie', 'Julia', 'Grace', 'Judy', 'Theresa', 'Madison', 'Beverly', 'Denise', 'Marilyn', 'Amber', 'Danielle', 'Brittany', 'Diana', 'Abigail', 'Jane', 'Lori', 'Tammy', 'Marilyn', 'Kathy'];
+      const foreignLastNames = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis', 'Rodriguez', 'Martinez', 'Hernandez', 'Lopez', 'Wilson', 'Anderson', 'Thomas', 'Taylor', 'Moore', 'Jackson', 'Martin', 'Lee', 'Thompson', 'White', 'Harris', 'Sanchez', 'Clark', 'Ramirez', 'Lewis', 'Robinson', 'Walker', 'Young', 'Allen', 'King', 'Wright', 'Scott', 'Torres', 'Nguyen', 'Hill', 'Flores', 'Green', 'Adams', 'Nelson', 'Baker', 'Hall', 'Rivera', 'Campbell', 'Mitchell', 'Carter', 'Roberts', 'Gomez', 'Phillips', 'Evans', 'Turner', 'Diaz', 'Parker', 'Cruz', 'Edwards', 'Collins', 'Reyes', 'Stewart', 'Morris', 'Morales', 'Murphy', 'Cook', 'Rogers', 'Gutierrez', 'Ortiz', 'Morgan', 'Cooper', 'Peterson', 'Bailey', 'Reed', 'Kelly', 'Howard', 'Ramos', 'Kim', 'Cox', 'Ward', 'Richardson', 'Watson', 'Brooks', 'Chavez', 'Wood', 'James', 'Bennett', 'Gray', 'Mendoza', 'Ruiz', 'Hughes', 'Price', 'Alvarez', 'Castillo', 'Sanders', 'Patel', 'Myers', 'Long', 'Ross', 'Foster', 'Jimenez', 'Powell', 'Jenkins', 'Perry', 'Russell', 'Sullivan', 'Bell', 'Coleman', 'Butler', 'Henderson', 'Barnes', 'Gonzales', 'Fisher', 'Vasquez', 'Simmons', 'Romero', 'Jordan', 'Patterson', 'Alexander', 'Hamilton', 'Graham', 'Reynolds', 'Griffin', 'Wallace', 'Moreno', 'West', 'Cole', 'Hayes', 'Bryant', 'Herrera', 'Gibson', 'Ellis', 'Tran', 'Medina', 'Aguilar', 'Stevens', 'Murray', 'Ford', 'Castro', 'Marshall', 'Owens', 'Harrison', 'Fernandez', 'Mcdonald', 'Woods', 'Washington', 'Kennedy', 'Wells', 'Vargas', 'Henry', 'Chen', 'Freeman', 'Webb', 'Tucker', 'Guzman', 'Burns', 'Crawford', 'Olson', 'Simpson', 'Porter', 'Hunter', 'Gordon', 'Mendez', 'Silva', 'Shaw', 'Snyder', 'Mason', 'Dixon', 'Munoz', 'Hunt', 'Hicks', 'Holmes', 'Palmer', 'Wagner', 'Black', 'Robertson', 'Boyd', 'Rose', 'Stone', 'Salazar', 'Fox', 'Warren', 'Mills', 'Meyer', 'Rice', 'Schmidt', 'Garza', 'Daniels', 'Ferguson', 'Nichols', 'Stephens', 'Soto', 'Weaver', 'Ryan', 'Gardner', 'Payne', 'Grant', 'Dunn', 'Kelley', 'Spencer', 'Hawkins', 'Arnold', 'Pierce', 'Vazquez', 'Hansen', 'Peters', 'Santos', 'Hart', 'Bradley', 'Knight', 'Elliott', 'Cunningham', 'Duncan', 'Armstrong', 'Hudson', 'Carroll', 'Lane', 'Riley', 'Andrews', 'Alvarado', 'Ray', 'Delgado', 'Berry', 'Perkins', 'Hoffman', 'Johnston', 'Matthews', 'Pena', 'Richards', 'Contreras', 'Willis', 'Carpenter', 'Lawrence', 'Sandoval', 'Guerrero', 'George', 'Chapman', 'Rios', 'Estrada', 'Ortega', 'Watkins', 'Greene', 'Nunez', 'Wheeler', 'Valdez', 'Harper', 'Lynch', 'Barton', 'Haley', 'Maldonado', 'Barker', 'Reese', 'Francis', 'Burgess', 'Adkins', 'Goodman', 'Curry', 'Brady', 'Christensen', 'Potter', 'Walton', 'Goodwin', 'Mullins', 'Molina', 'Webster', 'Fischer', 'Campos', 'Avila', 'Sherman', 'Todd', 'Chang', 'Blake', 'Malone', 'Wolf', 'Hodges', 'Juarez', 'Gill', 'Farmer', 'Hines', 'Gallagher', 'Duran', 'Hubbard', 'Cannon', 'Miranda', 'Wang', 'Saunders', 'Tate', 'Mack', 'Hammond', 'Carrillo', 'Townsend', 'Wise', 'Ingram', 'Barton', 'Mejia', 'Ayala', 'Schroeder', 'Hampton', 'Rowe', 'Parsons', 'Frank', 'Waters', 'Strickland', 'Osborne', 'Maxwell', 'Chan', 'Deleon', 'Norman', 'Harrington', 'Casey', 'Patton', 'Logan', 'Bowers', 'Mueller', 'Glover', 'Floyd', 'Hartman', 'Buchanan', 'Cobb', 'French', 'Kramer', 'Mccormick', 'Clarke', 'Tyler', 'Gibbs', 'Moody', 'Conner', 'Sparks', 'Mcguire', 'Leon', 'Bauer', 'Norton', 'Pope', 'Flynn', 'Hogan', 'Robles', 'Salinas', 'Yates', 'Lindsey', 'Lloyd', 'Marsh', 'Mcbride', 'Owen', 'Solis', 'Pham', 'Lang', 'Pratt', 'Lara', 'Brock', 'Ballard', 'Trujillo', 'Shaffer', 'Drake', 'Roman', 'Aguirre', 'Morton', 'Stokes', 'Lamb', 'Pacheco', 'Patrick', 'Cochran', 'Shepherd', 'Cain', 'Burnett', 'Hess', 'Li', 'Cervantes', 'Olsen', 'Briggs', 'Ochoa', 'Cabrera', 'Velasquez', 'Montoya', 'Roth', 'Meyers', 'Cardenas', 'Fuentes', 'Weiss', 'Hoover', 'Wilkins', 'Nicholson', 'Underwood', 'Short', 'Carson', 'Morrow', 'Colon', 'Holloway', 'Summers', 'Bryan', 'Petersen', 'Mckenzie', 'Serrano', 'Wilcox', 'Carey', 'Clayton', 'Poole', 'Calderon', 'Gallegos', 'Greer', 'Rivas', 'Guerra', 'Decker', 'Collier', 'Wall', 'Whitaker', 'Bass', 'Flowers', 'Davenport', 'Conley', 'Houston', 'Huff', 'Copeland', 'Hood', 'Monroe', 'Massey', 'Roberson', 'Combs', 'Franco', 'Larsen', 'Pittman', 'Randall', 'Skinner', 'Wilkinson', 'Kirby', 'Cameron', 'Bridges', 'Anthony', 'Richard', 'Kirk', 'Bruce', 'Singleton', 'Mathis', 'Bradford', 'Boone', 'Abbott', 'Charles', 'Allison', 'Sweeney', 'Atkinson', 'Horn', 'Jefferson', 'Rosario', 'York', 'Christian', 'Phelps', 'Farrell', 'Castaneda', 'Nash', 'Dickerson', 'Bond', 'Wyatt', 'Foley', 'Chase', 'Gates', 'Vincent', 'Mathews', 'Hodge', 'Garrison', 'Trevino', 'Villarreal', 'Heath', 'Dalton', 'Valencia', 'Callahan', 'Hensley', 'Atkins', 'Huffman', 'Roy', 'Boyer', 'Shields', 'Lin', 'Hancock', 'Grimes', 'Glenn', 'Cline', 'Delacruz', 'Camacho', 'Dillon', 'Parrish', 'Oneill', 'Melton', 'Booth', 'Kane', 'Berg', 'Harrell', 'Pitts', 'Savage', 'Wiggins', 'Brennan', 'Salas', 'Marks', 'Russo', 'Sawyer', 'Baxter', 'Golden', 'Hutchinson', 'Liu', 'Walter', 'McDowell', 'Wiley', 'Rich', 'Humphrey', 'Johns', 'Koch', 'Suarez', 'Hobbs', 'Beard', 'Gilmore', 'Ibarra', 'Keith', 'Macias', 'Khan', 'Andrade', 'Ware', 'Stephenson', 'Henson', 'Wilkerson', 'Dyer', 'Mcclure', 'Blackwell', 'Mercado', 'Tanner', 'Eaton', 'Clay', 'Barron', 'Beasley', 'Oneal', 'Small', 'Preston', 'Valentine', 'Maldonado', 'Gaines', 'Watts', 'Doyle', 'Bartlett', 'Buck', 'Valdez', 'Callahan', 'Hensley', 'Atkins', 'Huffman', 'Roy', 'Boyer', 'Shields', 'Lin', 'Hancock', 'Grimes', 'Glenn', 'Cline', 'Delacruz', 'Camacho', 'Dillon', 'Parrish', 'Oneill', 'Melton', 'Booth', 'Kane', 'Berg', 'Harrell', 'Pitts', 'Savage', 'Wiggins', 'Brennan', 'Salas', 'Marks', 'Russo', 'Sawyer', 'Baxter', 'Golden', 'Hutchinson', 'Liu', 'Walter', 'McDowell', 'Wiley', 'Rich', 'Humphrey', 'Johns', 'Koch', 'Suarez', 'Hobbs', 'Beard', 'Gilmore', 'Ibarra', 'Keith', 'Macias', 'Khan', 'Andrade', 'Ware', 'Stephenson', 'Henson', 'Wilkerson', 'Dyer', 'Mcclure', 'Blackwell', 'Mercado', 'Tanner', 'Eaton', 'Clay', 'Barron', 'Beasley', 'Oneal', 'Small', 'Preston', 'Valentine', 'Maldonado', 'Gaines', 'Watts', 'Doyle', 'Bartlett', 'Buck', 'Valdez'];
+      const foreignCountries = ['United States', 'United Kingdom', 'Canada', 'Australia', 'Germany', 'France', 'Spain', 'Italy', 'Netherlands', 'Sweden', 'Norway', 'Denmark', 'Switzerland', 'Belgium', 'Ireland', 'New Zealand', 'Singapore', 'Brazil', 'Mexico', 'Argentina', 'Chile', 'South Africa', 'Portugal', 'Greece', 'Poland', 'Czech Republic', 'Austria', 'Finland', 'Hungary', 'Romania', 'Croatia', 'Bulgaria', 'Slovakia', 'Slovenia', 'Estonia', 'Latvia', 'Lithuania', 'Luxembourg', 'Malta', 'Cyprus', 'Iceland', 'Liechtenstein', 'Monaco', 'San Marino', 'Vatican City', 'Andorra', 'Japan', 'South Korea', 'Taiwan', 'Hong Kong', 'Philippines', 'Indonesia', 'Malaysia', 'Thailand', 'Vietnam', 'Myanmar', 'Cambodia', 'Laos', 'Bangladesh', 'Sri Lanka', 'Nepal', 'Bhutan', 'Maldives', 'Pakistan', 'Afghanistan', 'Iran', 'Iraq', 'Saudi Arabia', 'UAE', 'Qatar', 'Kuwait', 'Bahrain', 'Oman', 'Yemen', 'Jordan', 'Lebanon', 'Syria', 'Israel', 'Palestine', 'Turkey', 'Egypt', 'Morocco', 'Tunisia', 'Algeria', 'Libya', 'Sudan', 'Ethiopia', 'Kenya', 'Tanzania', 'Uganda', 'Ghana', 'Nigeria', 'Senegal', 'Ivory Coast', 'Cameroon', 'Gabon', 'Congo', 'DRC', 'Zambia', 'Zimbabwe', 'Botswana', 'Namibia', 'Mozambique', 'Madagascar', 'Mauritius', 'Seychelles', 'Comoros', 'Djibouti', 'Eritrea', 'Somalia', 'Rwanda', 'Burundi', 'Malawi', 'Lesotho', 'Swaziland', 'Angola', 'Guinea', 'Sierra Leone', 'Liberia', 'Togo', 'Benin', 'Burkina Faso', 'Niger', 'Mali', 'Mauritania', 'Chad', 'Central African Republic', 'Equatorial Guinea', 'São Tomé and Príncipe', 'Cape Verde', 'Gambia', 'Guinea-Bissau', 'Western Sahara', 'South Sudan', 'Eritrea', 'Djibouti', 'Somaliland', 'Puntland', 'Galmudug', 'Hirshabelle', 'South West State', 'Jubaland', 'Banaadir', 'Somalia', 'Somaliland', 'Puntland', 'Galmudug', 'Hirshabelle', 'South West State', 'Jubaland', 'Banaadir'];
+
+      firstName = foreignFirstNames[Math.floor(random1 * foreignFirstNames.length)];
+      lastName = foreignLastNames[Math.floor(random2 * foreignLastNames.length)];
+      countryName = foreignCountries[Math.floor(random3 * foreignCountries.length)];
+    } else {
+      // Use local names from the country-specific pool
+      firstName = firstNames[Math.floor(random1 * firstNames.length)];
+      lastName = lastNames[Math.floor(random2 * lastNames.length)];
+      countryName = countries[Math.floor(random3 * countries.length)];
+    }
+
+    const template = templates && templates.length > 0
+      ? templates[Math.floor(random4 * templates.length)]
+      : `Great tour experience in ${city}! We had a wonderful time exploring ${locationNames || city}.`;
+
+    // Use pre-calculated rating
+    const rating = ratings[i];
+
+    // Generate review date (within last 6 months) - more varied distribution
+    const reviewDate = new Date();
+    const daysAgo = Math.floor(Math.random() * 180);
+    reviewDate.setDate(reviewDate.getDate() - daysAgo);
+
+    // Generate review text with variations - ensure it's always a string
+    let reviewText = template || `Great tour experience in ${city}! We had a wonderful time exploring ${locationNames || city}.`;
+
+    // Add varied personal touches for more unique reviews
+    const personalTouches = [
+      ` We especially loved the ${duration || 'tour duration'} duration - perfect timing!`,
+      ` The meeting point was easy to find and convenient.`,
+      ` Would definitely come back and recommend to friends!`,
+      ` Our group had a wonderful time.`,
+      ` The experience exceeded our expectations!`,
+      ` Very well organized from start to finish.`,
+      ` Made our trip to ${city} unforgettable!`,
+      ` Great communication and clear instructions.`,
+      ` The timing was perfect - we saw everything without feeling rushed.`,
+      ` Such a memorable experience! We'll treasure these photos forever.`,
+      ` Worth every penny! One of the highlights of our trip.`,
+      ` The attention to detail was impressive.`,
+      ` We learned so much about the local culture and history.`,
+      ` Perfect for travelers who want an authentic experience.`,
+      ` The pace was just right - not too fast, not too slow.`,
+      ` We appreciated the insider tips and local recommendations.`,
+      ` The guide's passion for ${city} really shone through.`,
+      ` Great balance of information and free time to explore.`,
+      ` We felt safe and well taken care of throughout.`,
+      ` The small group size made it much more personal.`
+    ];
+
+    // Add 0-2 personal touches randomly for variety
+    const numTouches = Math.random() > 0.5 ? (Math.random() > 0.7 ? 2 : 1) : 0;
+    const usedTouches = new Set();
+    for (let t = 0; t < numTouches; t++) {
+      let touch;
+      do {
+        touch = personalTouches[Math.floor(Math.random() * personalTouches.length)];
+      } while (usedTouches.has(touch) && usedTouches.size < personalTouches.length);
+      usedTouches.add(touch);
+      reviewText += touch;
+    }
+
+    // Add location-specific mentions for more authenticity
+    if (locationsArray && locationsArray.length > 0 && Math.random() > 0.6) {
+      const specificLocation = locationsArray[Math.floor(Math.random() * locationsArray.length)];
+      const locationMentions = [
+        ` ${specificLocation} was particularly impressive.`,
+        ` We especially enjoyed visiting ${specificLocation}.`,
+        ` The highlight was definitely ${specificLocation}.`,
+        ` ${specificLocation} exceeded all our expectations.`
+      ];
+      reviewText += locationMentions[Math.floor(Math.random() * locationMentions.length)];
+    }
+
+    // Add provider name (without "The" prefix) for guided tours - replace "the guide" with provider name
+    if (category === 'Guided Tour' && supplier && Math.random() > 0.4) {
+      const providerName = supplier.fullName?.split(' ')[0] || supplier.companyName?.split(' ')[0] || null;
+      if (providerName) {
+        // Replace "the guide" with provider name (without "The")
+        reviewText = reviewText.replace(/the guide/gi, providerName);
+        reviewText = reviewText.replace(/The guide/gi, providerName);
+        reviewText = reviewText.replace(/guide/gi, providerName);
+      }
+    }
+
+    reviews.push({
+      id: `review-${i + 1}`,
+      author: {
+        name: `${firstName} ${lastName}`,
+        country: countryName,
+        avatar: `https://ui-avatars.com/api/?name=${firstName}+${lastName}&background=random&size=128`
+      },
+      rating: rating,
+      date: reviewDate.toISOString(),
+      text: reviewText,
+      verified: Math.random() > 0.2 // 80% verified bookings
+    });
+  }
+
+  // Sort by date (newest first)
+  reviews.sort((a, b) => new Date(b.date) - new Date(a.date));
+
+  return reviews;
+}
+
+// Helper function to recursively remove all ID fields from an object
+// IMPORTANT: Does NOT remove supplierId (needed for foreign key relationship)
+function removeAllIds(obj) {
+  if (obj === null || obj === undefined) return obj;
+  if (Array.isArray(obj)) {
+    return obj.map(item => removeAllIds(item));
+  }
+  if (typeof obj !== 'object') return obj;
+
+  const cleaned = {};
+  for (const [key, value] of Object.entries(obj)) {
+    // Skip ID-related fields (case-insensitive) BUT keep supplierId (it's needed!)
+    const keyLower = key.toLowerCase();
+    if (keyLower === 'id' ||
+      keyLower === 'tourid' ||
+      keyLower === 'tour_id' ||
+      // DO NOT remove supplierId - it's a foreign key, not an auto-generated ID
+      // keyLower === 'supplierid' ||  // REMOVED - supplierId is required!
+      // keyLower === 'supplier_id' ||  // REMOVED - supplierId is required!
+      keyLower === 'optionid' ||
+      keyLower === 'option_id') {
+      continue; // Skip this field
+    }
+    // Recursively clean nested objects
+    cleaned[key] = removeAllIds(value);
+  }
+  return cleaned;
+}
+
+// Background function to upload images to R2 and update tour
+// Runs asynchronously after tour creation to avoid blocking the response
+async function uploadImagesInBackground(tourId, imagesArray, city) {
+  try {
+    console.log(`   📤 Starting background R2 upload for tour ${tourId}...`);
+    const folder = `tours/${city.toLowerCase().replace(/\s+/g, '-')}`;
+    const uploadedUrls = await uploadMultipleImages(imagesArray, folder);
+
+    console.log(`   ✅ Uploaded ${uploadedUrls.length} images to R2 for tour ${tourId}`);
+
+    await prisma.tour.update({
+      where: { id: tourId },
+      data: {
+        images: JSON.stringify(uploadedUrls)
+      }
+    });
+
+    console.log(`   ✅ Tour ${tourId} updated with R2 URLs`);
+  } catch (error) {
+    console.error(`   ❌ Background R2 upload failed for tour ${tourId}:`, error.message);
+    // Do not throw - tour is already created, images remain as base64
+  }
+}
+
+// Upload images to R2 BEFORE tour creation (for faster submission)
+// This endpoint allows frontend to upload images first, then create tour with URLs
+app.post('/api/tours/upload-images', async (req, res) => {
+  try {
+    const { images, city } = req.body;
+
+    if (!images || !Array.isArray(images) || images.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid request',
+        message: 'Images array is required'
+      });
+    }
+
+    if (!city || typeof city !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid request',
+        message: 'City is required'
+      });
+    }
+
+    // Check if R2 is configured
+    if (!process.env.R2_ACCOUNT_ID || !process.env.R2_ACCESS_KEY_ID || !process.env.R2_SECRET_ACCESS_KEY) {
+      return res.status(500).json({
+        success: false,
+        error: 'R2 not configured',
+        message: 'Image upload service is not configured. Please contact support.'
+      });
+    }
+
+    console.log(`📤 Uploading ${images.length} images to R2 for city: ${city}`);
+    const uploadStartTime = Date.now();
+
+    const folder = `tours/${city.toLowerCase().replace(/\s+/g, '-')}`;
+    const uploadedUrls = await uploadMultipleImages(images, folder);
+
+    const uploadTime = Date.now() - uploadStartTime;
+    console.log(`✅ Uploaded ${uploadedUrls.length} images in ${uploadTime}ms`);
+
+    res.json({
+      success: true,
+      urls: uploadedUrls,
+      message: `Successfully uploaded ${uploadedUrls.length} images`
+    });
+  } catch (error) {
+    console.error('❌ Image upload error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Upload failed',
+      message: error.message || 'Failed to upload images'
+    });
+  }
+});
+
+// Create a new tour
+
+/**
+ * The operator name to print for a supplier's own tour.
+ *
+ * Deliberately not restricted to Latin characters: a filter that required
+ * [A-Za-z] once read valid Thai and Japanese company names as junk and
+ * replaced three live operators with our own brand.
+ *
+ * The bar is low on purpose. Rejecting a name here means falling back to null,
+ * and a null provider makes the page print our own brand as the operator of
+ * someone else's tour. A supplier's odd-looking entry is merely odd; our name
+ * on their tour is wrong. So anything with two real characters is kept, and a
+ * genuinely broken profile is fixed by asking the supplier, not by a regex.
+ */
+function supplierDisplayName(supplier) {
+  const clean = (v) => (typeof v === 'string' ? v.trim() : '');
+  const usable = (v) => clean(v).replace(/[\s\p{P}\p{S}]/gu, '').length >= 2;
+  const company = clean(supplier?.companyName);
+  const person = clean(supplier?.fullName);
+  if (usable(company)) return company;
+  if (usable(person)) return person;
+  return null;
+}
+
+app.post('/api/tours', async (req, res) => {
+  const createStartTime = Date.now();
+  try {
+    console.log('📥 Received tour creation request');
+    console.log('📦 Request body keys:', Object.keys(req.body));
+
+    // Check database connection first
+    try {
+      await prisma.$queryRaw`SELECT 1`;
+    } catch (dbCheckError) {
+      console.error('❌ Database connection check failed:', dbCheckError.message);
+      return res.status(503).json({
+        success: false,
+        error: 'Database unavailable',
+        message: 'Database is currently unavailable. Please try again in a few moments.',
+        details: process.env.NODE_ENV === 'development' ? dbCheckError.message : undefined
+      });
+    }
+
+    // CRITICAL: Remove ALL IDs from request body immediately (before any processing)
+    const cleanedBody = removeAllIds(req.body);
+
+    // CRITICAL: Also remove pricingType from request body recursively (prevents P2022 errors)
+    // BUT PRESERVE groupPricingTiers - it's a valid field!
+    const removePricingType = (obj) => {
+      if (obj === null || obj === undefined) return obj;
+      if (Array.isArray(obj)) {
+        return obj.map(item => removePricingType(item));
+      }
+      if (typeof obj === 'object') {
+        const cleaned = {};
+        for (const [key, value] of Object.entries(obj)) {
+          const keyLower = key.toLowerCase();
+          // Skip pricingType fields BUT preserve groupPricingTiers
+          if (keyLower === 'pricingtype' || keyLower === 'pricing_type') {
+            continue; // Skip pricingType fields
+          }
+          // CRITICAL: Preserve groupPricingTiers and itineraryItems - they are valid fields!
+          if (keyLower === 'grouppricingtiers' || keyLower === 'itineraryitems' || keyLower === 'detaileditinerary') {
+            cleaned[key] = value; // Keep as-is, don't recurse
+            continue;
+          }
+          cleaned[key] = removePricingType(value);
+        }
+        return cleaned;
+      }
+      return obj;
+    };
+    const finalCleanedBody = removePricingType(cleanedBody);
+
+    console.log('🧹 Cleaned request body (all IDs and pricingType removed recursively)');
+    const requestSummary = {
+      ...finalCleanedBody,
+      images: Array.isArray(finalCleanedBody.images)
+        ? `[${finalCleanedBody.images.length} images]`
+        : typeof finalCleanedBody.images,
+      tourOptionsCount: Array.isArray(finalCleanedBody.tourOptions)
+        ? finalCleanedBody.tourOptions.length
+        : 0
+    };
+    console.log('📦 Request summary:', requestSummary);
+
+    const {
+      supplierId,
+      title,
+      country,
+      city,
+      category,
+      locations,
+      duration,
+      pricePerPerson,
+      // pricingType removed - we infer from groupPrice/maxGroupSize
+      maxGroupSize,
+      groupPrice,
+      groupPricingTiers, // Extract groupPricingTiers for main tour - CRITICAL FIELD!
+      unavailableDates, // Legacy - Extract unavailableDates
+      unavailableDaysOfWeek, // Extract unavailableDaysOfWeek
+      languages,
+      highlights,
+      itineraryItems,
+      detailedItinerary,
+      visitorInfo,
+      checklistItems,
+      // Added missing fields to prevent crash
+      shortDescription,
+      fullDescription,
+      included,
+      notIncluded,
+      meetingPoint,
+      images,
+      tourTypes,
+      usesTransportation,
+      transportationTypes,
+      multiCityTravel,
+      multiCityLocations,
+      isMultiDayTour,
+      // tourOptions handled later manually to avoid conflict
+      locationEntryTickets,
+      guideType,
+      currency,
+      pickupIncluded,
+      activityProvider,
+      externalActivityId
+    } = finalCleanedBody; // Use final cleaned body (IDs and pricingType removed)
+
+    // #region agent log
+    const logPath = '/Users/talhanawaz/Desktop/globewithlocals-latest/.cursor/debug.log';
+    try {
+      const logEntry = JSON.stringify({
+        location: 'server.js:2468',
+        message: 'POST endpoint - extracted groupPricingTiers from request',
+        data: {
+          hasGroupPricingTiers: !!groupPricingTiers,
+          groupPricingTiersType: typeof groupPricingTiers,
+          isString: typeof groupPricingTiers === 'string',
+          isArray: Array.isArray(groupPricingTiers),
+          preview: groupPricingTiers ? (typeof groupPricingTiers === 'string' ? groupPricingTiers.substring(0, 100) : JSON.stringify(groupPricingTiers).substring(0, 100)) : null
+        },
+        timestamp: Date.now(),
+        sessionId: 'debug-session',
+        runId: 'run1',
+        hypothesisId: 'D'
+      }) + '\n';
+      fs.appendFileSync(logPath, logEntry);
+    } catch (e) { }
+    // #endregion
+
+    // Debug: Log each field
+    console.log('🔍 Field validation:');
+    console.log('  supplierId:', supplierId ? '✅' : '❌', supplierId);
+    console.log('  title:', title ? '✅' : '❌', title);
+    console.log('  country:', country ? '✅' : '❌', country);
+    console.log('  city:', city ? '✅' : '❌', city);
+    console.log('  category:', category ? '✅' : '❌', category);
+    console.log('  fullDescription:', fullDescription ? '✅' : '❌', fullDescription ? `${fullDescription.substring(0, 50)}...` : '');
+    console.log('  included:', included ? '✅' : '❌', included ? `${included.substring(0, 50)}...` : '');
+    console.log('  images:', images ? '✅' : '❌', typeof images, Array.isArray(images) ? images.length : 'not array');
+    console.log('  locations:', locations ? '✅' : '❌', typeof locations);
+    console.log('  duration:', duration ? '✅' : '❌', duration);
+    console.log('  pricePerPerson:', pricePerPerson ? '✅' : '❌', pricePerPerson);
+    // Infer pricing type from groupPrice/maxGroupSize presence
+    const inferredPricingType = (groupPrice && maxGroupSize) ? 'per_group' : 'per_person';
+    console.log('  pricingType (inferred):', inferredPricingType);
+    console.log('  maxGroupSize:', maxGroupSize || 'N/A');
+    console.log('  groupPrice:', groupPrice || 'N/A');
+    console.log('  languages:', languages ? '✅' : '❌', typeof languages);
+
+    // Validation
+    if (!supplierId || !title || !country || !city || !category || !fullDescription || !included || !images) {
+      const missing = [];
+      if (!supplierId) missing.push('supplierId');
+      if (!title) missing.push('title');
+      if (!country) missing.push('country');
+      if (!city) missing.push('city');
+      if (!category) missing.push('category');
+      if (!fullDescription) missing.push('fullDescription');
+      if (!included) missing.push('included');
+      if (!images) missing.push('images');
+
+      console.log('❌ Missing fields:', missing);
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields',
+        message: `Missing required fields: ${missing.join(', ')}`
+      });
+    }
+
+    // Infer pricing type from groupPrice/maxGroupSize OR groupPricingTiers presence
+    // All tours now use group pricing with tiered pricing structure
+    const hasGroupPricingTiers = groupPricingTiers && (
+      (typeof groupPricingTiers === 'string' && groupPricingTiers.trim().length > 0) ||
+      (Array.isArray(groupPricingTiers) && groupPricingTiers.length > 0)
+    );
+    const isPerGroupPricing = !!(groupPrice && maxGroupSize) || hasGroupPricingTiers;
+
+    // Validate pricing based on inferred pricing type
+    if (isPerGroupPricing) {
+      if (!groupPrice || isNaN(parseFloat(groupPrice)) || parseFloat(groupPrice) <= 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid group price',
+          message: 'Group price is required and must be a positive number for per-group pricing'
+        });
+      }
+      if (!maxGroupSize || isNaN(parseInt(maxGroupSize)) || parseInt(maxGroupSize) < 1) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid group size',
+          message: 'Max group size is required and must be at least 1 for per-group pricing'
+        });
+      }
+    } else {
+      if (!pricePerPerson || isNaN(parseFloat(pricePerPerson)) || parseFloat(pricePerPerson) <= 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid price',
+          message: 'Price per person is required and must be a positive number'
+        });
+      }
+    }
+
+    // Check if supplier is approved
+    let supplierCheck;
+    try {
+      supplierCheck = await prisma.supplier.findUnique({
+        where: { id: parseInt(supplierId) },
+        select: { id: true, status: true, fullName: true, companyName: true }
+      });
+    } catch (dbError) {
+      console.error('❌ Database error fetching supplier:', dbError);
+      return res.status(500).json({
+        success: false,
+        error: 'Database error',
+        message: 'Failed to fetch supplier information'
+      });
+    }
+
+    if (!supplierCheck) {
+      return res.status(404).json({
+        success: false,
+        error: 'Supplier not found',
+        message: 'Supplier account not found'
+      });
+    }
+
+    if (supplierCheck.status !== 'approved') {
+      return res.status(403).json({
+        success: false,
+        error: 'Supplier not approved',
+        message: 'Your supplier account is under review. You can create tours only after your account is approved by admin. Please wait for approval notification via email.'
+      });
+    }
+
+    // Validate category
+    const validCategories = ['Entry Ticket', 'Guided Tour', 'Mini Tour'];
+    if (!validCategories.includes(category)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid category',
+        message: 'Category must be "Entry Ticket", "Guided Tour", or "Mini Tour"'
+      });
+    }
+
+    // Parse JSON fields
+    let locationsArray = [];
+    let imagesArray = [];
+    let languagesArray = [];
+    let highlightsArray = [];
+    let tourTypesArray = [];
+
+    try {
+      // Parse locations
+      if (locations) {
+        if (typeof locations === 'string') {
+          try {
+            locationsArray = JSON.parse(locations);
+          } catch (e) {
+            console.error('❌ Failed to parse locations JSON:', e.message);
+            locationsArray = [];
+          }
+        } else if (Array.isArray(locations)) {
+          locationsArray = locations;
+        }
+      }
+
+      // Parse images - CRITICAL for tour creation
+      if (images) {
+        if (typeof images === 'string') {
+          try {
+            imagesArray = JSON.parse(images);
+          } catch (e) {
+            console.error('❌ Failed to parse images JSON:', e.message);
+            console.error('   Images string length:', images.length);
+            console.error('   Images string preview:', images.substring(0, 200));
+            return res.status(400).json({
+              success: false,
+              error: 'Invalid images format',
+              message: 'Images must be a valid JSON array. Please ensure all images are properly uploaded.',
+              details: process.env.NODE_ENV === 'development' ? e.message : undefined
+            });
+          }
+        } else if (Array.isArray(images)) {
+          imagesArray = images;
+        } else {
+          console.error('❌ Images is not a string or array:', typeof images);
+          return res.status(400).json({
+            success: false,
+            error: 'Invalid images format',
+            message: 'Images must be a JSON array string or an array.'
+          });
+        }
+      }
+
+      // Parse languages
+      if (languages) {
+        if (typeof languages === 'string') {
+          try {
+            languagesArray = JSON.parse(languages);
+          } catch (e) {
+            console.error('❌ Failed to parse languages JSON:', e.message);
+            languagesArray = ['English']; // Default fallback
+          }
+        } else if (Array.isArray(languages)) {
+          languagesArray = languages;
+        }
+      }
+
+      // Parse highlights (optional)
+      if (highlights) {
+        if (typeof highlights === 'string') {
+          try {
+            highlightsArray = JSON.parse(highlights);
+          } catch (e) {
+            console.error('❌ Failed to parse highlights JSON:', e.message);
+            highlightsArray = [];
+          }
+        } else if (Array.isArray(highlights)) {
+          highlightsArray = highlights;
+        }
+      }
+
+      // Parse tourTypes (optional)
+      if (tourTypes) {
+        if (typeof tourTypes === 'string') {
+          try {
+            tourTypesArray = JSON.parse(tourTypes);
+          } catch (e) {
+            console.error('❌ Failed to parse tourTypes JSON:', e.message);
+            tourTypesArray = [];
+          }
+        } else if (Array.isArray(tourTypes)) {
+          tourTypesArray = tourTypes;
+        }
+      }
+
+      // Validate parsed arrays are actually arrays
+      if (!Array.isArray(locationsArray)) locationsArray = [];
+      if (!Array.isArray(imagesArray)) {
+        console.error('❌ Parsed imagesArray is not an array:', typeof imagesArray);
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid images format',
+          message: 'Images must be a valid JSON array.'
+        });
+      }
+      if (!Array.isArray(languagesArray)) languagesArray = ['English'];
+      if (!Array.isArray(highlightsArray)) highlightsArray = [];
+      if (!Array.isArray(tourTypesArray)) tourTypesArray = [];
+
+    } catch (parseError) {
+      console.error('❌ Unexpected JSON parse error:', parseError);
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid JSON format',
+        message: 'Failed to parse tour data. Please check all fields are properly formatted.',
+        details: process.env.NODE_ENV === 'development' ? parseError.message : undefined
+      });
+    }
+
+    // Validate images (minimum 4)
+    console.log('🖼️ Images validation:');
+    console.log('  imagesArray type:', typeof imagesArray);
+    console.log('  imagesArray is array:', Array.isArray(imagesArray));
+    console.log('  imagesArray length:', imagesArray?.length);
+
+    if (!Array.isArray(imagesArray)) {
+      console.log('❌ Images is not an array:', typeof imagesArray);
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid images format',
+        message: 'Images must be an array. Please ensure all images are properly uploaded.'
+      });
+    }
+
+    // Filter out any invalid image entries (null, undefined, empty strings)
+    const validImages = imagesArray.filter(img => img && typeof img === 'string' && img.trim().length > 0);
+
+    if (validImages.length < 4) {
+      console.log('❌ Insufficient valid images:', validImages.length, 'provided, need at least 4');
+      console.log('   Total images received:', imagesArray.length);
+      console.log('   Invalid images:', imagesArray.length - validImages.length);
+      return res.status(400).json({
+        success: false,
+        error: 'Insufficient images',
+        message: `At least 4 valid images are required. You provided ${validImages.length} valid images out of ${imagesArray.length} total.`
+      });
+    }
+
+    // Use only valid images
+    imagesArray = validImages;
+
+    console.log('✅ All validations passed, creating tour...');
+
+    // ==================== WORLD-CLASS SEO SLUG GENERATION ====================
+    // Professional slug generation with intelligent keyword extraction and SEO optimization
+    // Format: {location}-{keyword}-{tour-type} or {city}-{location}-{tour-type}
+
+    // Enhanced slugify function - handles edge cases and special characters
+    const slugify = (text) => {
+      if (!text) return '';
+      return text
+        .toLowerCase()
+        .trim()
+        .normalize('NFD') // Normalize unicode characters (é -> e)
+        .replace(/[\u0300-\u036f]/g, '') // Remove diacritics
+        .replace(/[^\w\s-]/g, '') // Remove special characters
+        .replace(/[\s_-]+/g, '-') // Replace spaces and underscores with hyphens
+        .replace(/^-+|-+$/g, '') // Remove leading/trailing hyphens
+        .substring(0, 50); // Max length for individual parts
+    };
+
+    // World-class tour type extraction with priority-based matching
+    const extractTourType = (title, category) => {
+      const titleLower = title.toLowerCase();
+      const titleWords = titleLower.split(/\s+/);
+
+      // Priority 1: Time-based experiences (most specific)
+      const timeBased = [
+        { keywords: ['sunrise'], type: 'sunrise-tour' },
+        { keywords: ['sunset'], type: 'sunset-tour' },
+        { keywords: ['morning'], type: 'morning-tour' },
+        { keywords: ['afternoon'], type: 'afternoon-tour' },
+        { keywords: ['evening', 'night'], type: 'evening-tour' },
+        { keywords: ['full-day', 'full day', 'day trip', 'day-trip'], type: 'full-day-tour' },
+        { keywords: ['half-day', 'half day'], type: 'half-day-tour' },
+        { keywords: ['multi-day', 'multi day'], type: 'multi-day-tour' }
+      ];
+
+      for (const { keywords, type } of timeBased) {
+        if (keywords.some(kw => titleLower.includes(kw))) {
+          return type;
+        }
+      }
+
+      // Priority 2: Activity-based experiences
+      const activityBased = [
+        { keywords: ['food', 'culinary', 'cooking', 'dining'], type: 'food-tour' },
+        { keywords: ['photography', 'photo', 'photography tour'], type: 'photography-tour' },
+        { keywords: ['walking', 'walk', 'heritage walk'], type: 'walking-tour' },
+        { keywords: ['bike', 'cycling', 'bicycle'], type: 'bike-tour' },
+        { keywords: ['boat', 'cruise', 'river'], type: 'boat-tour' },
+        { keywords: ['shopping', 'market', 'bazaar'], type: 'shopping-tour' },
+        { keywords: ['spiritual', 'temple', 'pilgrimage'], type: 'spiritual-tour' },
+        { keywords: ['adventure', 'trekking', 'hiking'], type: 'adventure-tour' }
+      ];
+
+      for (const { keywords, type } of activityBased) {
+        if (keywords.some(kw => titleLower.includes(kw))) {
+          return type;
+        }
+      }
+
+      // Priority 3: Experience quality/type
+      const experienceType = [
+        { keywords: ['heritage', 'historical'], type: 'heritage-tour' },
+        { keywords: ['cultural', 'culture'], type: 'cultural-tour' },
+        { keywords: ['private'], type: 'private-tour' },
+        { keywords: ['group'], type: 'group-tour' },
+        { keywords: ['premium', 'deluxe', 'luxury'], type: 'premium-tour' },
+        { keywords: ['express', 'quick'], type: 'express-tour' },
+        { keywords: ['entry', 'ticket', 'admission'], type: 'entry-ticket' }
+      ];
+
+      for (const { keywords, type } of experienceType) {
+        if (keywords.some(kw => titleLower.includes(kw))) {
+          return type;
+        }
+      }
+
+      // Priority 4: Category-based fallback
+      if (category === 'Guided Tour') return 'guided-tour';
+      if (category === 'Entry Ticket') return 'entry-ticket';
+      if (category === 'Mini Tour') return 'mini-tour';
+
+      // Final fallback
+      return 'tour';
+    };
+
+    // World-class location extraction for ALL Asian cities with comprehensive attraction database
+    const extractPrimaryLocation = (locationsArray, city, title) => {
+      // Comprehensive database of well-known Asian attractions (SEO gold for entire continent)
+      const asianAttractions = {
+        // India
+        'agra': ['taj mahal', 'agra fort', 'fatehpur sikri', 'mehtab bagh', 'baby taj', 'itmad ud daulah'],
+        'delhi': ['red fort', 'india gate', 'qutb minar', 'jama masjid', 'humayun tomb', 'lotus temple', 'akshardham', 'jantar mantar', 'raj ghat', 'purana qila'],
+        'jaipur': ['amber fort', 'city palace', 'hawa mahal', 'jal mahal', 'nahargarh fort', 'jantar mantar', 'albert hall', 'birla temple', 'jaigarh fort'],
+        'mumbai': ['gateway of india', 'marine drive', 'elephanta caves', 'chhatrapati shivaji terminus'],
+        'varanasi': ['ghats', 'kashi vishwanath', 'sarnath', 'dashashwamedh ghat'],
+        'goa': ['basilica of bom jesus', 'anjuna beach', 'baga beach', 'calangute beach'],
+        'kolkata': ['victoria memorial', 'howrah bridge', 'kalighat temple'],
+        'chennai': ['kapaleeshwarar temple', 'marina beach', 'fort st george'],
+        'bangalore': ['lalbagh botanical garden', 'cubbon park', 'tipu sultan palace'],
+        'hyderabad': ['charminar', 'golconda fort', 'hussain sagar'],
+        'udaipur': ['city palace', 'lake pichola', 'jag mandir'],
+        'jodhpur': ['mehrangarh fort', 'jaswant thada', 'umaid bhawan palace'],
+        'kerala': ['backwaters', 'alleppey', 'munnar', 'fort kochi'],
+
+        // Japan
+        'tokyo': ['tokyo tower', 'senso-ji temple', 'shibuya crossing', 'meiji shrine', 'imperial palace', 'skytree', 'harajuku', 'ginza', 'tsukiji market'],
+        'kyoto': ['fushimi inari', 'kinkaku-ji', 'ginkaku-ji', 'kiyomizu-dera', 'arashiyama bamboo grove', 'nijo castle', 'philosopher path', 'golden pavilion'],
+        'osaka': ['osaka castle', 'dotonbori', 'universal studios', 'shinsaibashi', 'osaka aquarium'],
+        'nara': ['todaiji temple', 'nara park', 'kasuga taisha', 'deer park'],
+        'hiroshima': ['peace memorial park', 'atomic bomb dome', 'miyajima', 'itsukushima shrine'],
+        'yokohama': ['chinatown', 'minato mirai', 'sankeien garden'],
+        'sapporo': ['sapporo snow festival', 'odori park', 'susukino'],
+        'okinawa': ['shuri castle', 'churaumi aquarium', 'kokusai street'],
+
+        // Thailand
+        'bangkok': ['grand palace', 'wat pho', 'wat arun', 'chatuchak market', 'wat phra kaew', 'khao san road', 'lumphini park', 'wat saket'],
+        'chiang mai': ['doi suthep', 'old city', 'night bazaar', 'elephant sanctuary', 'wat phra singh', 'wat chedi luang'],
+        'phuket': ['patong beach', 'big buddha', 'phang nga bay', 'james bond island', 'old town'],
+        'pattaya': ['walking street', 'sanctuary of truth', 'nong nooch garden'],
+        'ayutthaya': ['ayutthaya historical park', 'wat mahathat', 'wat phra si sanphet'],
+        'sukhothai': ['sukhothai historical park', 'wat mahathat'],
+        'krabi': ['railay beach', 'phang nga bay', 'ao nang', 'tiger cave temple'],
+
+        // Singapore
+        'singapore': ['marina bay sands', 'gardens by the bay', 'sentosa', 'merlion', 'orchard road', 'little india', 'chinatown', 'universal studios', 'singapore flyer', 'clarke quay'],
+
+        // Indonesia
+        'bali': ['tanah lot', 'uluwatu temple', 'ubud monkey forest', 'tegallalang rice terrace', 'besakih temple', 'waterbom', 'seminyak', 'kuta beach'],
+        'jakarta': ['national monument', 'old town', 'ancol dreamland', 'taman mini'],
+        'yogyakarta': ['borobudur', 'prambanan', 'sultan palace', 'malioboro'],
+        'bandung': ['tangkuban perahu', 'gedung sate', 'braga street'],
+
+        // Malaysia
+        'kuala lumpur': ['petronas towers', 'batu caves', 'kl tower', 'merdeka square', 'china town', 'little india'],
+        'penang': ['george town', 'kek lok si temple', 'penang hill', 'batu ferringhi'],
+        'langkawi': ['sky bridge', 'cable car', 'pantai cenang'],
+        'malacca': ['red square', 'a famosa', 'jonker street'],
+
+        // Vietnam
+        'hanoi': ['hoan kiem lake', 'old quarter', 'temple of literature', 'ho chi minh mausoleum', 'water puppet theatre'],
+        'ho chi minh city': ['war remnants museum', 'cu chi tunnels', 'notre dame cathedral', 'ben thanh market', 'reunification palace'],
+        'hue': ['imperial city', 'thien mu pagoda', 'royal tombs'],
+        'hoi an': ['ancient town', 'japanese bridge', 'my son sanctuary'],
+        'halong bay': ['halong bay', 'cat ba island', 'sapa'],
+
+        // Philippines
+        'manila': ['intramuros', 'rizal park', 'fort santiago', 'manila cathedral'],
+        'cebu': ['magellan cross', 'fort san pedro', 'temple of leah'],
+        'boracay': ['white beach', 'puka shell beach', 'ariel point'],
+        'palawan': ['underground river', 'el nido', 'coron'],
+
+        // South Korea
+        'seoul': ['gyeongbokgung palace', 'namsan tower', 'myeongdong', 'insadong', 'bukchon hanok village', 'dongdaemun', 'hongdae'],
+        'busan': ['haeundae beach', 'gamcheon culture village', 'beomeosa temple', 'jagalchi market'],
+        'jeju': ['jeju island', 'seongsan ilchulbong', 'manjanggul cave', 'cheonjiyeon waterfall'],
+
+        // China
+        'beijing': ['great wall', 'forbidden city', 'temple of heaven', 'summer palace', 'tiananmen square', 'beijing hutongs'],
+        'shanghai': ['the bund', 'yu garden', 'shanghai tower', 'tianzifang', 'nanjing road'],
+        'xi an': ['terracotta warriors', 'ancient city wall', 'muslim quarter'],
+        'guilin': ['li river', 'yangshuo', 'elephant trunk hill'],
+        'hong kong': ['victoria peak', 'disneyland', 'ocean park', 'temple street', 'star ferry', 'big buddha'],
+
+        // Sri Lanka
+        'colombo': ['gangaramaya temple', 'national museum', 'galle face green'],
+        'kandy': ['temple of the tooth', 'royal botanical garden', 'kandy lake'],
+        'sigiriya': ['sigiriya rock', 'lion rock'],
+        'galle': ['galle fort', 'old town'],
+
+        // Nepal
+        'kathmandu': ['durbar square', 'swayambhunath', 'pashupatinath', 'boudhanath'],
+        'pokhara': ['phewa lake', 'world peace pagoda', 'annapurna'],
+
+        // Myanmar
+        'yangon': ['shwedagon pagoda', 'sule pagoda', 'bogyoke market'],
+        'bagan': ['bagan temples', 'ananda temple', 'sunset point'],
+
+        // Cambodia
+        'phnom penh': ['royal palace', 'silver pagoda', 'killing fields'],
+        'siem reap': ['angkor wat', 'bayon temple', 'ta prohm', 'angkor thom'],
+
+        // Bangladesh
+        'dhaka': ['lalbagh fort', 'ahsan manzil', 'national museum'],
+
+        // Pakistan
+        'lahore': ['badshahi mosque', 'lahore fort', 'shalimar gardens'],
+        'karachi': ['mazar e quaid', 'clifton beach'],
+
+        // Taiwan
+        'taipei': ['taipei 101', 'chiang kai shek memorial', 'longshan temple', 'shilin night market'],
+        'taichung': ['rainbow village', 'sun moon lake'],
+
+        // Mongolia
+        'ulaanbaatar': ['gandantegchinlen monastery', 'genghis khan square'],
+
+        // Kazakhstan
+        'almaty': ['kok tobe', 'big almaty lake'],
+
+        // Uzbekistan
+        'samarkand': ['registan', 'gur e amir', 'bibi khanym mosque'],
+        'tashkent': ['chorsu bazaar', 'khast imam complex'],
+
+        // General Asian landmarks (fallback)
+        'general': ['temple', 'pagoda', 'palace', 'fort', 'beach', 'market', 'garden', 'museum', 'monument', 'shrine', 'monastery', 'mosque', 'cathedral', 'bridge', 'tower', 'park', 'lake', 'mountain', 'island', 'cave', 'waterfall']
+      };
+
+      // Normalize city name for lookup
+      const cityLower = city.toLowerCase().trim();
+
+      // Find city-specific attractions
+      let cityAttractions = [];
+      for (const [cityKey, attractions] of Object.entries(asianAttractions)) {
+        if (cityLower.includes(cityKey) || cityKey.includes(cityLower)) {
+          cityAttractions = attractions;
+          break;
+        }
+      }
+
+      // If no city match, use general attractions
+      if (cityAttractions.length === 0) {
+        cityAttractions = asianAttractions.general || [];
+      }
+
+      // Combine city-specific and general attractions
+      const allAttractions = [...cityAttractions, ...(asianAttractions.general || [])];
+
+      if (Array.isArray(locationsArray) && locationsArray.length > 0) {
+        // Strategy 1: Find well-known attraction from comprehensive Asian database (best for SEO)
+        for (const location of locationsArray) {
+          const locationLower = location.toLowerCase();
+          const matchedAttraction = allAttractions.find(attr =>
+            locationLower.includes(attr) || attr.includes(locationLower) ||
+            attr.split(' ').some(word => locationLower.includes(word))
+          );
+          if (matchedAttraction) {
+            return location; // Use the full location name
+          }
+        }
+
+        // Strategy 2: Check if title mentions a well-known attraction
+        const titleLower = title.toLowerCase();
+        for (const attr of allAttractions) {
+          if (titleLower.includes(attr) || attr.split(' ').some(word => titleLower.includes(word))) {
+            // Find matching location or use attraction name
+            const matchingLocation = locationsArray.find(loc => {
+              const locLower = loc.toLowerCase();
+              return locLower.includes(attr) || attr.includes(locLower) ||
+                attr.split(' ').some(word => locLower.includes(word));
+            });
+            if (matchingLocation) return matchingLocation;
+            // If title mentions it but not in locations, use first location
+            return locationsArray[0];
+          }
+        }
+
+        // Strategy 3: Use first location (supplier's priority)
+        return locationsArray[0];
+      }
+
+      // Strategy 4: Extract from title if no locations provided
+      if (title) {
+        const titleLower = title.toLowerCase();
+        for (const attr of allAttractions) {
+          if (titleLower.includes(attr) || attr.split(' ').some(word => titleLower.includes(word))) {
+            // Capitalize properly
+            return attr.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+          }
+        }
+      }
+
+      // Final fallback: city name
+      return city;
+    };
+
+    // Generate world-class SEO-optimized slug
+    const primaryLocation = extractPrimaryLocation(locationsArray, city, title);
+    const tourType = extractTourType(title, category);
+
+    let locationSlug = slugify(primaryLocation);
+    const typeSlug = tourType;
+    const citySlug = slugify(city);
+
+    // Advanced keyword extraction with NLP-like prioritization
+    const extractKeywords = (text, locationSlug, citySlug) => {
+      // Comprehensive stop words (common words that don't add SEO value)
+      const stopWords = new Set([
+        'the', 'and', 'for', 'with', 'from', 'to', 'of', 'a', 'an', 'in', 'on', 'at', 'by',
+        'tour', 'tours', 'ticket', 'tickets', 'guide', 'guided', 'private', 'group',
+        'skip', 'line', 'book', 'booking', 'visit', 'visiting', 'see', 'seeing',
+        'day', 'hour', 'hours', 'minute', 'minutes', 'your', 'you', 'this', 'that',
+        'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had',
+        'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might'
+      ]);
+
+      // High-value SEO keywords (prioritize these)
+      const seoKeywords = new Set([
+        'sunrise', 'sunset', 'heritage', 'cultural', 'food', 'walking', 'photography',
+        'full-day', 'half-day', 'express', 'premium', 'deluxe', 'exclusive', 'authentic',
+        'traditional', 'royal', 'spiritual', 'adventure', 'culinary', 'shopping',
+        'morning', 'evening', 'night', 'detailed', 'comprehensive', 'personalized'
+      ]);
+
+      // Extract meaningful words
+      const words = text
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '') // Remove diacritics
+        .replace(/[^\w\s]/g, ' ') // Replace special chars with spaces
+        .split(/\s+/)
+        .map(word => word.replace(/[^\w]/g, '')) // Clean each word
+        .filter(word => {
+          const cleanWord = word.toLowerCase();
+          return cleanWord.length > 3 && // Minimum 4 characters
+            !stopWords.has(cleanWord) &&
+            cleanWord !== locationSlug.toLowerCase() &&
+            cleanWord !== citySlug.toLowerCase() &&
+            !cleanWord.match(/^\d+$/); // Exclude pure numbers
+        })
+        .filter((word, index, self) => self.indexOf(word) === index) // Remove duplicates
+        .sort((a, b) => {
+          // Prioritize SEO keywords
+          const aIsSEO = Array.from(seoKeywords).some(kw => a.includes(kw));
+          const bIsSEO = Array.from(seoKeywords).some(kw => b.includes(kw));
+          if (aIsSEO && !bIsSEO) return -1;
+          if (!aIsSEO && bIsSEO) return 1;
+          // Then prioritize longer words (more specific)
+          return b.length - a.length;
+        })
+        .slice(0, 8); // Take up to 8 meaningful words
+
+      return words;
+    };
+
+    // Extract keywords AFTER we have locationSlug and citySlug
+    const titleKeywords = extractKeywords(title, locationSlug, citySlug);
+
+    // The title is the most reliable description of a tour, so it comes first.
+    //
+    // The landmark-and-keyword machinery below invents a subject: it gave
+    // "Mumbai Sightseeing Tour - No Shopping Stops" the slug
+    // gateway-of-india-shopping-tour, matching the word "shopping" while
+    // ignoring the "No", and filed "Delhi to Agra: Taj Mahal Day Trip" under
+    // agra-fort. A URL that contradicts the tour is worse than a plain one.
+    const titleSlug = slugify(title);
+    let baseSlug = '';
+    if (titleSlug && titleSlug.split('-').filter(Boolean).length >= 3) {
+      baseSlug = titleSlug.split('-').slice(0, 9).join('-');
+    }
+
+    const isGenericLocation = locationSlug === citySlug || locationSlug.length < 5;
+    if (!baseSlug) {
+
+    // Strategy 1: If location is well-known and specific, use: location-tour-type
+    if (!isGenericLocation && locationSlug.length >= 5) {
+      baseSlug = `${locationSlug}-${typeSlug}`;
+    }
+    // Strategy 2: If location is generic, use: city-location-tour-type
+    else if (isGenericLocation && citySlug && citySlug !== locationSlug) {
+      baseSlug = `${citySlug}-${locationSlug}-${typeSlug}`;
+    }
+    // Strategy 3: Fallback to city-tour-type
+    else {
+      baseSlug = `${citySlug}-${typeSlug}`;
+    }
+    }
+
+    // SEO Enhancement: Add keyword if slug is too short or generic
+    if (baseSlug.length < 20 && titleKeywords.length > 0) {
+      const firstKeyword = slugify(titleKeywords[0]);
+      if (firstKeyword && firstKeyword.length > 3 && !baseSlug.includes(firstKeyword)) {
+        // Insert keyword between location and type
+        if (baseSlug.includes(`${citySlug}-${locationSlug}`)) {
+          baseSlug = `${citySlug}-${locationSlug}-${firstKeyword}-${typeSlug}`;
+        } else if (baseSlug.startsWith(locationSlug)) {
+          baseSlug = `${locationSlug}-${firstKeyword}-${typeSlug}`;
+        } else {
+          baseSlug = `${citySlug}-${firstKeyword}-${typeSlug}`;
+        }
+      }
+    }
+
+    // Ensure base slug doesn't exceed optimal length (60 chars max for SEO)
+    if (baseSlug.length > 60) {
+      const parts = baseSlug.split('-');
+      baseSlug = parts.slice(0, Math.min(parts.length, 5)).join('-'); // Max 5 parts
+    }
+
+    // Ensure slug is unique (try different word combinations before using counter)
+    // CRITICAL: This loop MUST guarantee a unique slug before proceeding
+    let slug = baseSlug;
+    let attempt = 0;
+    const maxAttempts = 30;
+    let slugIsUnique = false;
+
+    while (attempt < maxAttempts && !slugIsUnique) {
+      // Check if slug already exists
+      const existingTour = await prisma.tour.findUnique({
+        where: { slug }
+      });
+
+      if (!existingTour) {
+        // Slug is unique! Exit loop
+        slugIsUnique = true;
+        break;
+      }
+
+      // Slug exists, try next strategy
+      attempt++;
+
+      // Strategy 1: Try adding keywords from title one by one (most SEO-friendly)
+      if (attempt <= titleKeywords.length && titleKeywords.length > 0) {
+        const keyword = slugify(titleKeywords[attempt - 1]);
+        if (keyword && keyword.length > 3 && keyword !== locationSlug && keyword !== citySlug) {
+          // Try different positions for keyword
+          if (attempt % 2 === 1) {
+            slug = `${locationSlug}-${keyword}-${typeSlug}`;
+          } else {
+            slug = `${citySlug}-${keyword}-${typeSlug}`;
+          }
+          continue;
+        }
+      }
+
+      // Strategy 2: Try keyword combinations (2 keywords)
+      if (attempt > titleKeywords.length && attempt <= titleKeywords.length * 2 && titleKeywords.length >= 2) {
+        const idx1 = Math.floor((attempt - titleKeywords.length - 1) / titleKeywords.length);
+        const idx2 = (attempt - titleKeywords.length - 1) % titleKeywords.length;
+        if (idx1 < titleKeywords.length && idx2 < titleKeywords.length && idx1 !== idx2) {
+          const kw1 = slugify(titleKeywords[idx1]);
+          const kw2 = slugify(titleKeywords[idx2]);
+          if (kw1 && kw2 && kw1.length > 3 && kw2.length > 3) {
+            slug = `${locationSlug}-${kw1}-${kw2}-${typeSlug}`;
+            continue;
+          }
+        }
+      }
+
+      // Strategy 3: Try city + keyword + type (for city-specific tours)
+      if (attempt === titleKeywords.length * 2 + 1 && citySlug && citySlug !== locationSlug && titleKeywords.length > 0) {
+        const keyword = slugify(titleKeywords[0]);
+        if (keyword && keyword.length > 3) {
+          slug = `${citySlug}-${keyword}-${typeSlug}`;
+          continue;
+        }
+      }
+
+      // Strategy 4: Try location + city + keyword + type
+      if (attempt === titleKeywords.length * 2 + 2 && citySlug && citySlug !== locationSlug && titleKeywords.length > 0) {
+        const keyword = slugify(titleKeywords[0]);
+        if (keyword && keyword.length > 3) {
+          slug = `${locationSlug}-${citySlug}-${keyword}-${typeSlug}`;
+          continue;
+        }
+      }
+
+      // Strategy 5: Try different keyword + city combinations
+      if (attempt > titleKeywords.length * 2 + 2 && titleKeywords.length >= 2) {
+        const keywordIndex = (attempt - titleKeywords.length * 2 - 3) % titleKeywords.length;
+        const keyword = slugify(titleKeywords[keywordIndex]);
+        if (keyword && keyword.length > 3 && keyword !== locationSlug) {
+          slug = `${keyword}-${citySlug}-${typeSlug}`;
+          continue;
+        }
+      }
+
+      // Strategy 6: Try location + city + type (simple combination)
+      if (attempt === titleKeywords.length * 2 + 3 && citySlug && citySlug !== locationSlug) {
+        slug = `${locationSlug}-${citySlug}-${typeSlug}`;
+        continue;
+      }
+
+      // If we've exhausted all keyword strategies, break to try custom words
+      // (Don't use timestamp hash here - custom words are more SEO-friendly)
+      break;
+    }
+
+    // Final safety check - ensure slug is unique using custom descriptive words for ALL Asian cities
+    // CRITICAL: Only proceed if slug is NOT unique yet (prevents P2002 errors)
+    if (!slugIsUnique && (attempt >= maxAttempts || (attempt > 0 && slug === baseSlug))) {
+      // Comprehensive custom words for Asian tours - SEO-friendly and meaningful for entire continent
+      const asianTourWords = [
+        // Heritage & Culture (Universal Asian themes)
+        'heritage', 'cultural', 'traditional', 'authentic', 'classic', 'royal', 'imperial', 'ancient',
+        // Experience Types (Premium offerings)
+        'premium', 'deluxe', 'exclusive', 'private', 'personalized', 'custom', 'luxury', 'vip',
+        'express', 'detailed', 'comprehensive', 'extended', 'full-day', 'half-day', 'multi-day',
+        // Time-based (Universal)
+        'sunrise', 'sunset', 'evening', 'morning', 'afternoon', 'night', 'dawn', 'dusk',
+        // Activity Types (Pan-Asian activities)
+        'photography', 'walking', 'cycling', 'food', 'culinary', 'shopping', 'spiritual', 'adventure',
+        'nature', 'wildlife', 'beach', 'mountain', 'island', 'river', 'cruise', 'sailing',
+        // Location Types (Universal Asian landmarks)
+        'temple', 'pagoda', 'fort', 'palace', 'bazaar', 'market', 'garden', 'monument', 'shrine',
+        'monastery', 'mosque', 'cathedral', 'bridge', 'tower', 'park', 'lake', 'cave', 'waterfall',
+        'museum', 'gallery', 'village', 'town', 'district', 'quarter', 'street',
+        // Quality Indicators (Trust signals)
+        'guided', 'expert', 'local', 'native', 'certified', 'professional', 'licensed', 'official',
+        'award-winning', 'recommended', 'popular', 'famous', 'iconic', 'legendary'
+      ];
+
+      // Try custom words first (more SEO-friendly than numbers)
+      let wordIndex = 0;
+      let finalSlug = `${baseSlug}-${asianTourWords[wordIndex]}`;
+
+      while (wordIndex < asianTourWords.length && !slugIsUnique) {
+        const existingTour = await prisma.tour.findUnique({
+          where: { slug: finalSlug }
+        });
+        if (!existingTour) {
+          slug = finalSlug;
+          slugIsUnique = true;
+          break;
+        }
+        wordIndex++;
+        if (wordIndex < asianTourWords.length) {
+          finalSlug = `${baseSlug}-${asianTourWords[wordIndex]}`;
+        }
+      }
+
+      // If all custom words are exhausted, try combining with city
+      if (!slugIsUnique && wordIndex >= asianTourWords.length && citySlug && citySlug !== locationSlug) {
+        let combinedWordIndex = 0;
+        finalSlug = `${baseSlug}-${citySlug}-${asianTourWords[combinedWordIndex]}`;
+
+        while (combinedWordIndex < Math.min(15, asianTourWords.length) && !slugIsUnique) {
+          const existingTour = await prisma.tour.findUnique({
+            where: { slug: finalSlug }
+          });
+          if (!existingTour) {
+            slug = finalSlug;
+            slugIsUnique = true;
+            break;
+          }
+          combinedWordIndex++;
+          if (combinedWordIndex < asianTourWords.length) {
+            finalSlug = `${baseSlug}-${citySlug}-${asianTourWords[combinedWordIndex]}`;
+          }
+        }
+      }
+
+      // If all single words are exhausted, try word combinations (NO NUMBERS ALLOWED)
+      if (!slugIsUnique && wordIndex >= asianTourWords.length) {
+        // Try combinations of two words for more unique slugs
+        const combinationWords = [
+          'premium-guided', 'exclusive-local', 'authentic-cultural', 'private-expert',
+          'deluxe-experience', 'custom-tour', 'personalized-journey', 'luxury-adventure',
+          'certified-professional', 'award-winning-local', 'recommended-tour', 'popular-experience',
+          'iconic-heritage', 'legendary-cultural', 'traditional-authentic', 'royal-imperial',
+          'ancient-heritage', 'sunrise-guided', 'sunset-experience', 'full-day-tour',
+          'half-day-adventure', 'multi-day-journey', 'walking-tour', 'photography-experience',
+          'food-culinary', 'shopping-adventure', 'spiritual-journey', 'nature-wildlife',
+          'beach-cruise', 'mountain-adventure', 'island-exploration', 'river-cruise',
+          'temple-pagoda', 'fort-palace', 'bazaar-market', 'garden-monument',
+          'museum-gallery', 'village-town', 'district-quarter', 'street-exploration'
+        ];
+
+        let comboIndex = 0;
+        while (comboIndex < combinationWords.length && !slugIsUnique) {
+          finalSlug = `${baseSlug}-${combinationWords[comboIndex]}`;
+          const existingTour = await prisma.tour.findUnique({
+            where: { slug: finalSlug }
+          });
+          if (!existingTour) {
+            slug = finalSlug;
+            slugIsUnique = true;
+            break;
+          }
+          comboIndex++;
+        }
+
+        // If combinations exhausted, try triple combinations with city
+        if (!slugIsUnique && comboIndex >= combinationWords.length && citySlug && citySlug !== locationSlug) {
+          const cityCombinations = [
+            `${citySlug}-premium`, `${citySlug}-exclusive`, `${citySlug}-authentic`,
+            `${citySlug}-local`, `${citySlug}-guided`, `${citySlug}-expert`,
+            `${citySlug}-tour`, `${citySlug}-experience`, `${citySlug}-adventure`
+          ];
+
+          for (const cityCombo of cityCombinations) {
+            finalSlug = `${baseSlug}-${cityCombo}`;
+            const existingTour = await prisma.tour.findUnique({
+              where: { slug: finalSlug }
+            });
+            if (!existingTour) {
+              slug = finalSlug;
+              slugIsUnique = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    // CRITICAL FINAL CHECK: Verify slug is unique before proceeding (prevents P2002 errors)
+    if (!slugIsUnique) {
+      // One final check - if somehow we still don't have a unique slug, try more descriptive suffixes
+      const finalCheck = await prisma.tour.findUnique({
+        where: { slug }
+      });
+      if (finalCheck) {
+        // Try a few more descriptive suffixes before using timestamp
+        const descriptiveSuffixes = ['tour', 'experience', 'adventure', 'journey', 'exploration', 'discovery'];
+        let foundUnique = false;
+
+        for (const suffix of descriptiveSuffixes) {
+          const testSlug = `${baseSlug}-${suffix}`;
+          const exists = await prisma.tour.findUnique({
+            where: { slug: testSlug }
+          });
+          if (!exists) {
+            slug = testSlug;
+            slugIsUnique = true;
+            foundUnique = true;
+            console.log('✅ Found unique slug with descriptive suffix:', slug);
+            break;
+          }
+        }
+
+        // If still not unique, try more word combinations (NO NUMBERS OR TIMESTAMPS)
+        if (!foundUnique) {
+          const extendedSuffixes = [
+            'premium-tour', 'exclusive-experience', 'authentic-adventure', 'local-guided',
+            'expert-tour', 'professional-guided', 'certified-local', 'official-tour',
+            'recommended-experience', 'popular-tour', 'famous-adventure', 'iconic-tour',
+            'legendary-experience', 'classic-tour', 'traditional-guided', 'cultural-adventure'
+          ];
+
+          for (const suffix of extendedSuffixes) {
+            const testSlug = `${baseSlug}-${suffix}`;
+            const exists = await prisma.tour.findUnique({
+              where: { slug: testSlug }
+            });
+            if (!exists) {
+              slug = testSlug;
+              slugIsUnique = true;
+              foundUnique = true;
+              console.log('✅ Found unique slug with extended suffix:', slug);
+              break;
+            }
+          }
+
+          // Final fallback: use base slug with city if available (guaranteed unique with city context)
+          if (!foundUnique && citySlug && citySlug !== locationSlug) {
+            slug = `${baseSlug}-${citySlug}-tour`;
+            slugIsUnique = true; // Assume unique with city context
+            console.log('✅ Using city-context slug as final fallback:', slug);
+          } else if (!foundUnique) {
+            // Absolute last resort: use a generic but descriptive suffix
+            slug = `${baseSlug}-guided-tour`;
+            slugIsUnique = true; // Force uniqueness - this should be extremely rare
+            console.log('⚠️  Using forced unique slug (should be extremely rare):', slug);
+          }
+        }
+      } else {
+        // Slug is actually unique, mark it as such
+        slugIsUnique = true;
+      }
+    }
+
+    // Validate and truncate slug length (max 60 characters for SEO)
+    const MAX_SLUG_LENGTH = 60;
+    if (slug.length > MAX_SLUG_LENGTH) {
+      console.warn(`⚠️  Slug too long (${slug.length} chars), truncating to ${MAX_SLUG_LENGTH} chars`);
+      // Keep location + type, remove extra parts
+      const parts = slug.split('-');
+      const locationPart = locationSlug;
+      const typePart = typeSlug;
+
+      // If base slug is already too long, truncate location
+      const baseSlug = `${locationPart}-${typePart}`;
+      if (baseSlug.length > MAX_SLUG_LENGTH) {
+        const maxLocationLength = MAX_SLUG_LENGTH - typePart.length - 1; // -1 for hyphen
+        slug = `${locationPart.substring(0, maxLocationLength)}-${typePart}`;
+      } else {
+        // Keep base slug, remove extra keywords
+        slug = baseSlug;
+      }
+
+      // Final check - ensure we're under limit
+      if (slug.length > MAX_SLUG_LENGTH) {
+        slug = slug.substring(0, MAX_SLUG_LENGTH).replace(/-+$/, ''); // Remove trailing hyphens
+      }
+    }
+
+    console.log(`📝 Generated slug: "${slug}" (${slug.length} characters)`);
+
+    // For fast tour creation: store base64 images initially, upload to R2 in background
+    let imageUrls = imagesArray;
+    let needsR2Upload = false;
+
+    if (process.env.R2_ACCOUNT_ID && process.env.R2_ACCESS_KEY_ID && process.env.R2_SECRET_ACCESS_KEY) {
+      const hasBase64Images = imagesArray.some(img => img.startsWith('data:image'));
+      if (hasBase64Images) {
+        console.log('📸 Images will be uploaded to R2 in background after tour creation');
+        imageUrls = imagesArray; // keep base64 for initial save
+        needsR2Upload = true;
+      } else {
+        console.log('ℹ️  Images are already URLs, skipping R2 upload');
+        imageUrls = imagesArray;
+      }
+    } else {
+      console.error('❌ R2 not configured!');
+      console.error('   R2_ACCOUNT_ID:', process.env.R2_ACCOUNT_ID ? '✅ Set' : '❌ Missing');
+      console.error('   R2_ACCESS_KEY_ID:', process.env.R2_ACCESS_KEY_ID ? '✅ Set' : '❌ Missing');
+      console.error('   R2_SECRET_ACCESS_KEY:', process.env.R2_SECRET_ACCESS_KEY ? '✅ Set' : '❌ Missing');
+
+      if (process.env.NODE_ENV === 'production') {
+        return res.status(500).json({
+          success: false,
+          error: 'Image storage not configured',
+          message: 'R2 is required for image storage in production. Please configure R2 environment variables.',
+          details: 'Add R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, and R2_SECRET_ACCESS_KEY to Render environment variables.'
+        });
+      }
+
+      console.warn('⚠️  Using base64 images (development mode only - NOT for production!)');
+    }
+
+    // Parse tour options if provided (accept both 'options' and 'tourOptions' field names)
+    // CRITICAL: Use finalCleanedBody (NOT cleanedBody) to ensure pricingType is removed
+    let tourOptions = finalCleanedBody.options || finalCleanedBody.tourOptions || [];
+
+    // Validate tourOptions is an array
+    if (tourOptions && !Array.isArray(tourOptions)) {
+      console.warn('⚠️  tourOptions is not an array, attempting to parse:', typeof tourOptions);
+      try {
+        if (typeof tourOptions === 'string') {
+          tourOptions = JSON.parse(tourOptions);
+        } else {
+          tourOptions = [];
+        }
+      } catch (parseError) {
+        console.error('❌ Failed to parse tourOptions:', parseError);
+        tourOptions = [];
+      }
+    }
+
+    // Ensure tourOptions is an array
+    if (!Array.isArray(tourOptions)) {
+      tourOptions = [];
+    }
+
+    // CRITICAL: Remove ALL id fields from tourOptions to prevent ID conflicts
+    tourOptions = tourOptions.map((opt, idx) => {
+      // Ensure opt is an object
+      if (!opt || typeof opt !== 'object') {
+        console.warn(`⚠️  Tour option ${idx + 1} is not a valid object, skipping`);
+        return null;
+      }
+      // Aggressively remove ALL possible ID fields AND pricingType
+      const { id, tourId, tour_id, optionId, option_id, pricingType, pricing_type, ...cleanOption } = opt;
+      if (id || tourId || tour_id || optionId || option_id || pricingType || pricing_type) {
+        console.warn(`⚠️  Tour option ${idx + 1} had ID fields or pricingType, removing:`, { id, tourId, tour_id, optionId, option_id, pricingType, pricing_type });
+      }
+      // CRITICAL: Explicitly remove pricingType from cleanOption as well (double safety)
+      delete cleanOption.pricingType;
+      delete cleanOption.pricing_type;
+      // Double-check: remove any remaining ID-like fields AND pricing-related fields
+      Object.keys(cleanOption).forEach(key => {
+        const keyLower = key.toLowerCase();
+        if (keyLower === 'id' || keyLower.includes('id') && (keyLower.includes('tour') || keyLower.includes('option'))) {
+          delete cleanOption[key];
+          console.warn(`⚠️  Removed additional ID-like field: ${key}`);
+        }
+        // Also remove any pricing-related fields (but keep groupPricingTiers!)
+        if (keyLower.includes('pricing') && keyLower !== 'grouppricingtiers') {
+          delete cleanOption[key];
+          console.warn(`⚠️  Removed pricing-related field: ${key}`);
+        }
+      });
+      return cleanOption;
+    }).filter(opt => opt !== null); // Remove null entries
+
+    console.log('📦 Tour options received:', {
+      hasOptions: !!req.body.options,
+      hasTourOptions: !!req.body.tourOptions,
+      optionsCount: tourOptions.length,
+      options: tourOptions.map((opt, idx) => ({
+        index: idx + 1,
+        title: opt.optionTitle || opt.title,
+        hasId: !!opt.id,
+        ...(opt.id && { removedId: opt.id })
+      }))
+    });
+
+    // Create tour data object - NEVER include 'id' as it's auto-generated
+    const tourData = {
+      supplierId: parseInt(supplierId),
+      title,
+      slug,
+      country,
+      city,
+      category,
+      locations: JSON.stringify(locationsArray),
+      duration: duration || 'Flexible',
+      // CRITICAL: Use FIRST tier (1 person) price for pricePerPerson - NOT groupPrice (which is last tier)
+      // This ensures "Starting from" shows the correct 1-person price
+      pricePerPerson: (() => {
+        if (groupPricingTiers) {
+          try {
+            const tiers = typeof groupPricingTiers === 'string'
+              ? JSON.parse(groupPricingTiers)
+              : groupPricingTiers;
+            if (Array.isArray(tiers) && tiers.length > 0 && tiers[0] && tiers[0].price) {
+              const firstTierPrice = parseFloat(tiers[0].price);
+              if (!isNaN(firstTierPrice) && firstTierPrice > 0) {
+                return firstTierPrice; // Use first tier (1 person) price
+              }
+            }
+          } catch (e) {
+            console.warn('⚠️ Failed to parse groupPricingTiers for pricePerPerson:', e.message);
+          }
+        }
+        // Fallback to provided pricePerPerson or groupPrice
+        return isPerGroupPricing
+          ? parseFloat(groupPrice || pricePerPerson || '0')
+          : parseFloat(pricePerPerson || '0');
+      })(),
+      currency: currency || 'INR',
+      shortDescription: shortDescription || null,
+      fullDescription,
+      highlights: highlightsArray && highlightsArray.length > 0 ? JSON.stringify(highlightsArray) : null,
+      included,
+      notIncluded: notIncluded || null,
+      meetingPoint: meetingPoint || null,
+      guideType: guideType || null,
+      tourTypes: tourTypesArray && tourTypesArray.length > 0 ? JSON.stringify(tourTypesArray) : null,
+      images: JSON.stringify(imageUrls), // Store R2 URLs instead of base64
+      languages: JSON.stringify(languagesArray || ['English']),
+      reviews: null,
+      status: 'draft',
+      // Who actually runs the tour. Travellers book us and are handed to this
+      // operator, so a blank provider is a real gap, not a cosmetic one.
+      //
+      // The supplier form does not ask for this field, so it always arrived
+      // empty and the tour page fell back to printing our own brand as the
+      // operator of somebody else's tour. A supplier who submits a tour IS the
+      // operator, so their own business name is the correct default.
+      activityProvider: activityProvider || supplierDisplayName(supplierCheck) || null,
+      externalActivityId: externalActivityId || null,
+      // Save simplified pricing fields
+      maxGroupSize: isPerGroupPricing && maxGroupSize ? parseInt(maxGroupSize) : null,
+      groupPrice: isPerGroupPricing && groupPrice ? parseFloat(groupPrice) : null,
+      unavailableDates: unavailableDates && typeof unavailableDates === 'string'
+        ? unavailableDates
+        : (unavailableDates && Array.isArray(unavailableDates) && unavailableDates.length > 0
+          ? JSON.stringify(unavailableDates)
+          : null), // Legacy
+      unavailableDaysOfWeek: unavailableDaysOfWeek && typeof unavailableDaysOfWeek === 'string'
+        ? unavailableDaysOfWeek
+        : (unavailableDaysOfWeek && Array.isArray(unavailableDaysOfWeek) && unavailableDaysOfWeek.length > 0
+          ? JSON.stringify(unavailableDaysOfWeek)
+          : null),
+      // Added missing fields for itinerary and transportation
+      itineraryItems: itineraryItems ? (typeof itineraryItems === 'string' ? itineraryItems : JSON.stringify(itineraryItems)) : '[]',
+      detailedItinerary: detailedItinerary || '',
+      visitorInfo: visitorInfo || '',
+      checklistItems: checklistItems || '',
+      pickupIncluded: !!pickupIncluded,
+      usesTransportation: !!usesTransportation,
+      transportationTypes: transportationTypes ? (typeof transportationTypes === 'string' ? transportationTypes : JSON.stringify(transportationTypes)) : '[]',
+      multiCityTravel: !!multiCityTravel,
+      multiCityLocations: multiCityLocations ? (typeof multiCityLocations === 'string' ? multiCityLocations : JSON.stringify(multiCityLocations)) : '[]',
+      locationEntryTickets: locationEntryTickets ? (typeof locationEntryTickets === 'string' ? locationEntryTickets : JSON.stringify(locationEntryTickets)) : '{}',
+      // CRITICAL: Save groupPricingTiers directly on Tour model (simple, reliable)
+      groupPricingTiers: (() => {
+        // #region agent log
+        const logPath = '/Users/talhanawaz/Desktop/globewithlocals-latest/.cursor/debug.log';
+        try {
+          const logEntry = JSON.stringify({
+            location: 'server.js:3559',
+            message: 'POST endpoint - processing groupPricingTiers before save',
+            data: {
+              hasGroupPricingTiers: !!groupPricingTiers,
+              groupPricingTiersType: typeof groupPricingTiers,
+              isString: typeof groupPricingTiers === 'string',
+              isArray: Array.isArray(groupPricingTiers),
+              preview: groupPricingTiers ? (typeof groupPricingTiers === 'string' ? groupPricingTiers.substring(0, 100) : JSON.stringify(groupPricingTiers).substring(0, 100)) : null
+            },
+            timestamp: Date.now(),
+            sessionId: 'debug-session',
+            runId: 'run1',
+            hypothesisId: 'D'
+          }) + '\n';
+          fs.appendFileSync(logPath, logEntry);
+        } catch (e) { }
+        // #endregion
+
+        if (!groupPricingTiers) {
+          // #region agent log
+          try {
+            const logEntry = JSON.stringify({
+              location: 'server.js:3575',
+              message: 'POST endpoint - groupPricingTiers is null/undefined',
+              data: { reason: 'groupPricingTiers not provided in request' },
+              timestamp: Date.now(),
+              sessionId: 'debug-session',
+              runId: 'run1',
+              hypothesisId: 'D'
+            }) + '\n';
+            fs.appendFileSync(logPath, logEntry);
+          } catch (e) { }
+          // #endregion
+          return null;
+        }
+        const finalValue = typeof groupPricingTiers === 'string'
+          ? groupPricingTiers
+          : (Array.isArray(groupPricingTiers) && groupPricingTiers.length > 0
+            ? JSON.stringify(groupPricingTiers)
+            : null);
+        console.log('✅ Saving groupPricingTiers on Tour model:', {
+          hasValue: !!finalValue,
+          preview: finalValue ? finalValue.substring(0, 200) : 'null',
+          tiersCount: Array.isArray(groupPricingTiers) ? groupPricingTiers.length : 'N/A'
+        });
+
+        // #region agent log
+        try {
+          const logEntry = JSON.stringify({
+            location: 'server.js:3585',
+            message: 'POST endpoint - groupPricingTiers processed, about to save',
+            data: {
+              finalValueExists: !!finalValue,
+              finalValuePreview: finalValue ? finalValue.substring(0, 100) : null,
+              willSave: !!finalValue
+            },
+            timestamp: Date.now(),
+            sessionId: 'debug-session',
+            runId: 'run1',
+            hypothesisId: 'D'
+          }) + '\n';
+          fs.appendFileSync(logPath, logEntry);
+        } catch (e) { }
+        // #endregion
+
+        return finalValue;
+      })()
+    };
+
+    // If main tour has groupPricingTiers, create a main tour option with those tiers
+    // CRITICAL: Always create main tour option if groupPricingTiers exists, regardless of isPerGroupPricing flag
+    let mainTourGroupPricingTiers = null;
+    if (groupPricingTiers) {
+      try {
+        if (typeof groupPricingTiers === 'string') {
+          mainTourGroupPricingTiers = JSON.parse(groupPricingTiers);
+        } else if (Array.isArray(groupPricingTiers)) {
+          mainTourGroupPricingTiers = groupPricingTiers;
+        }
+        console.log('📊 Main tour groupPricingTiers parsed:', {
+          count: mainTourGroupPricingTiers?.length,
+          tiers: mainTourGroupPricingTiers
+        });
+      } catch (e) {
+        console.warn('⚠️ Failed to parse main tour groupPricingTiers:', e.message);
+      }
+    }
+
+    // Create main tour option if main tour has group pricing tiers
+    if (mainTourGroupPricingTiers && Array.isArray(mainTourGroupPricingTiers) && mainTourGroupPricingTiers.length > 0) {
+      // Calculate price from first tier (lowest price)
+      const firstTierPrice = parseFloat(mainTourGroupPricingTiers[0]?.price || groupPrice || '0') || 0;
+      const mainTourOption = {
+        optionTitle: title,
+        optionDescription: shortDescription || fullDescription?.substring(0, 200) || 'Main tour option',
+        durationHours: (() => {
+          const durStr = (duration || '').toLowerCase();
+          const num = parseFloat(durStr.replace(/[^0-9.]/g, '')) || 3;
+          return durStr.includes('day') ? num * 24 : num;
+        })(),
+        price: firstTierPrice,
+        currency: currency || 'INR',
+        language: languagesArray?.[0] || 'English',
+        pickupIncluded: false,
+        entryTicketIncluded: false,
+        guideIncluded: true,
+        carIncluded: false,
+        groupPricingTiers: JSON.stringify(mainTourGroupPricingTiers),
+        sortOrder: -1 // Main tour option comes first
+      };
+      // Prepend main tour option to tourOptions
+      tourOptions = [mainTourOption, ...(tourOptions || [])];
+      console.log('✅ Created main tour option with groupPricingTiers:', {
+        tiers: mainTourGroupPricingTiers.length,
+        firstTierPrice,
+        tiersData: mainTourGroupPricingTiers,
+        groupPricingTiersString: mainTourOption.groupPricingTiers?.substring(0, 200) // Log first 200 chars
+      });
+    } else {
+      console.warn('⚠️ NOT creating main tour option - condition not met:', {
+        hasMainTourGroupPricingTiers: !!mainTourGroupPricingTiers,
+        isArray: Array.isArray(mainTourGroupPricingTiers),
+        length: mainTourGroupPricingTiers?.length,
+        groupPricingTiers: groupPricingTiers ? (typeof groupPricingTiers === 'string' ? groupPricingTiers.substring(0, 200) : 'not string') : 'null'
+      });
+    }
+
+    // Only add options if tourOptions array has items
+    if (tourOptions && Array.isArray(tourOptions) && tourOptions.length > 0) {
+      // Validate each option has required fields
+      const validOptions = tourOptions.filter((option, index) => {
+        if (!option || typeof option !== 'object') {
+          console.warn(`⚠️  Option ${index + 1} is not a valid object, skipping`);
+          return false;
+        }
+        const hasTitle = !!(option.optionTitle || option.title);
+        if (!hasTitle) {
+          console.warn(`⚠️  Option ${index + 1} is missing title, skipping`);
+          return false;
+        }
+        return true;
+      });
+
+      if (validOptions.length === 0) {
+        console.warn('⚠️  No valid tour options found, creating tour without options');
+      } else {
+        tourData.options = {
+          create: validOptions.map((option, index) => {
+            // CRITICAL: Remove any id field AND pricingType from option (prevents P2002 and P2022 errors)
+            // This prevents ID conflicts and pricing_type column errors
+            const { id, tourId, pricingType, pricing_type, ...cleanOption } = option;
+            if (id) {
+              console.warn(`⚠️  Option ${index + 1} had an id field (${id}), removing it to prevent conflicts`);
+            }
+            if (tourId) {
+              console.warn(`⚠️  Option ${index + 1} had a tourId field (${tourId}), removing it (will be set automatically)`);
+            }
+            if (pricingType || pricing_type) {
+              console.warn(`⚠️  Option ${index + 1} had pricingType field, removing it (backend infers from groupPrice/maxGroupSize)`);
+            }
+
+            // CRITICAL: Explicitly remove pricingType from cleanOption as well (double safety)
+            delete cleanOption.pricingType;
+            delete cleanOption.pricing_type;
+            // Infer pricing type for this option: if groupPrice and maxGroupSize exist, it's per_group
+            const optionIsPerGroup = !!(cleanOption.groupPrice && cleanOption.maxGroupSize);
+
+            // Calculate price based on inferred pricing type
+            let optionPrice = 0;
+            if (optionIsPerGroup && cleanOption.groupPrice) {
+              optionPrice = parseFloat(cleanOption.groupPrice);
+            } else if (cleanOption.price) {
+              optionPrice = parseFloat(cleanOption.price);
+            } else if (isPerGroupPricing && groupPrice) {
+              optionPrice = parseFloat(groupPrice);
+            } else {
+              optionPrice = parseFloat(pricePerPerson);
+            }
+
+            // Validate price is a valid number
+            if (isNaN(optionPrice) || optionPrice <= 0) {
+              console.warn(`⚠️  Option ${index + 1} has invalid price, using default`);
+              optionPrice = parseFloat(pricePerPerson) || 0;
+            }
+
+            // Ensure optionDescription is not empty (required field)
+            const optionDesc = (cleanOption.optionDescription || cleanOption.description || '').trim();
+            const finalOptionDesc = optionDesc || `Tour option ${index + 1}`;
+
+            // Build return object WITHOUT pricingType, maxGroupSize, and groupPrice
+            // maxGroupSize and groupPrice are excluded because columns don't exist in production DB yet
+            // groupPricingTiers is included - stored as JSON string in DB
+
+            // CRITICAL: Log groupPricingTiers to debug why it's not being saved
+            if (cleanOption.groupPricingTiers) {
+              console.log(`📊 Option ${index + 1} groupPricingTiers BEFORE save:`, {
+                type: typeof cleanOption.groupPricingTiers,
+                value: typeof cleanOption.groupPricingTiers === 'string'
+                  ? cleanOption.groupPricingTiers.substring(0, 200)
+                  : JSON.stringify(cleanOption.groupPricingTiers).substring(0, 200),
+                isArray: Array.isArray(cleanOption.groupPricingTiers)
+              });
+            } else {
+              console.warn(`⚠️ Option ${index + 1} has NO groupPricingTiers!`, {
+                optionTitle: cleanOption.optionTitle || cleanOption.title,
+                availableFields: Object.keys(cleanOption)
+              });
+            }
+
+            // CRITICAL: Handle groupPricingTiers FIRST - ensure it's always included if present
+            let finalGroupPricingTiers = null;
+            if (cleanOption.groupPricingTiers) {
+              try {
+                if (Array.isArray(cleanOption.groupPricingTiers)) {
+                  finalGroupPricingTiers = JSON.stringify(cleanOption.groupPricingTiers);
+                } else if (typeof cleanOption.groupPricingTiers === 'string') {
+                  // Already stringified, but verify it's valid JSON
+                  try {
+                    JSON.parse(cleanOption.groupPricingTiers); // Validate it's valid JSON
+                    finalGroupPricingTiers = cleanOption.groupPricingTiers;
+                  } catch (e) {
+                    console.warn(`⚠️ Option ${index + 1} groupPricingTiers string is invalid JSON, re-stringifying`);
+                    finalGroupPricingTiers = JSON.stringify(cleanOption.groupPricingTiers);
+                  }
+                } else {
+                  finalGroupPricingTiers = JSON.stringify(cleanOption.groupPricingTiers);
+                }
+                console.log(`✅ Option ${index + 1} groupPricingTiers processed successfully`);
+              } catch (e) {
+                console.error(`❌ Failed to process groupPricingTiers for option ${index + 1}:`, e.message);
+              }
+            }
+
+            const returnOption = {
+              optionTitle: (cleanOption.optionTitle || cleanOption.title || `Option ${index + 1}`).trim(),
+              optionDescription: finalOptionDesc,
+              durationHours: parseFloat(cleanOption.durationHours || cleanOption.duration || duration?.replace(/[^\d.]/g, '') || 3) || 3,
+              price: optionPrice,
+              currency: (cleanOption.currency || currency || 'INR').trim(),
+              language: (cleanOption.language || languagesArray?.[0] || 'English').trim(),
+              pickupIncluded: cleanOption.pickupIncluded || cleanOption.pickup_included || false,
+              entryTicketIncluded: cleanOption.entryTicketIncluded || cleanOption.entry_ticket_included || false,
+              guideIncluded: cleanOption.guideIncluded !== undefined ? cleanOption.guideIncluded : (cleanOption.guide_included !== undefined ? cleanOption.guide_included : true),
+              carIncluded: cleanOption.carIncluded || cleanOption.car_included || false,
+              // CRITICAL: Explicitly include groupPricingTiers if it exists
+              groupPricingTiers: finalGroupPricingTiers,
+              // maxGroupSize and groupPrice EXCLUDED - columns don't exist in production DB yet
+              sortOrder: index
+            };
+
+            // CRITICAL: Final check - ensure pricingType, maxGroupSize, and groupPrice are NOT in return object
+            delete returnOption.pricingType;
+            delete returnOption.pricing_type;
+            delete returnOption.maxGroupSize;
+            delete returnOption.max_group_size;
+            delete returnOption.groupPrice;
+            delete returnOption.group_price;
+
+            return returnOption;
+          })
+        };
+      }
+    }
+
+    // Create tour with options - with retry logic for race conditions
+    let tour;
+    let createAttempts = 0;
+    const MAX_CREATE_RETRIES = 3;
+    let finalTourData; // Declare outside loop for error handling
+
+    // CRITICAL: Ensure tourData does not have an id field at all
+    if ('id' in tourData) {
+      console.error('❌ CRITICAL: tourData contains id field! Removing it...');
+      delete tourData.id;
+    }
+
+    while (createAttempts < MAX_CREATE_RETRIES) {
+      try {
+        // Ensure no ID fields are present in tourData - deep clone to avoid mutation
+        finalTourData = JSON.parse(JSON.stringify(tourData));
+
+        // Remove id field and any other fields that don't belong to Tour model
+        if ('id' in finalTourData) {
+          console.warn('⚠️  Removing id field from tourData before creation');
+          delete finalTourData.id;
+        }
+
+        // Remove fields that don't exist in Tour model (these belong to TourOption or are request-only)
+        // Note: 'options' is valid (it's the relation field for nested creates)
+        const invalidFields = [
+          'groupPrice', 'group_price',
+          'maxGroupSize', 'max_group_size',
+          'pricingType', 'pricing_type',
+          'tourOptions',
+          'optionTitle', 'option_title',
+          'optionDescription', 'option_description',
+          'durationHours', 'duration_hours',
+          'pickupIncluded', 'pickup_included',
+          'entryTicketIncluded', 'entry_ticket_included',
+          'guideIncluded', 'guide_included',
+          'carIncluded', 'car_included'
+        ];
+        invalidFields.forEach(field => {
+          if (field in finalTourData) {
+            console.warn(`⚠️  Removing invalid field '${field}' from tourData (not in Tour model)`);
+            delete finalTourData[field];
+          }
+        });
+
+        // Double-check: ensure no option-related fields leaked into main tour data
+        const tourModelFields = [
+          'supplierId', 'title', 'slug', 'country', 'city', 'category', 'locations',
+          'duration', 'pricePerPerson', 'currency', 'shortDescription', 'fullDescription',
+          'highlights', 'included', 'notIncluded', 'meetingPoint', 'guideType', 'tourTypes',
+          'images', 'languages', 'reviews', 'status', 'options',
+          'itineraryItems', 'detailedItinerary', 'visitorInfo', 'checklistItems', 'pickupIncluded',
+          'maxGroupSize', 'groupPrice', 'groupPricingTiers', 'unavailableDates', 'unavailableDaysOfWeek',
+          'parentTourId', 'parentTour', 'activityProvider', 'externalActivityId'
+        ];
+        Object.keys(finalTourData).forEach(key => {
+          if (!tourModelFields.includes(key)) {
+            console.warn(`⚠️  Unexpected field '${key}' in finalTourData, removing it`);
+            delete finalTourData[key];
+          }
+        });
+
+        // Define ONLY valid TourOption fields (from Prisma schema) - moved outside if block for scope
+        // CRITICAL: maxGroupSize and groupPrice are EXCLUDED because they may not exist in production DB
+        // The migration to add these columns may not have been run yet
+        // These fields will be handled separately with error handling if they exist
+        const VALID_TOUR_OPTION_FIELDS = [
+          'optionTitle', 'optionDescription', 'durationHours', 'price', 'currency',
+          'language', 'pickupIncluded', 'entryTicketIncluded', 'guideIncluded',
+          'carIncluded', 'groupPricingTiers', 'sortOrder'
+          // maxGroupSize and groupPrice EXCLUDED - handled separately with error handling
+          // Note: pricingType removed - we infer pricing type from groupPrice/maxGroupSize presence
+          // groupPricingTiers is a JSON string array of {minPeople, maxPeople, price} objects
+        ];
+
+        // Also ensure no IDs in nested options - remove ALL possible id fields
+        // AND ensure only valid TourOption fields are included
+        if (finalTourData.options?.create) {
+          finalTourData.options.create = finalTourData.options.create.map((opt, idx) => {
+            // CRITICAL: Remove pricingType FIRST before any processing (prevents P2022 errors)
+            delete opt.pricingType;
+            delete opt.pricing_type;
+
+            // Create a clean object with ONLY valid TourOption fields
+            const cleanOpt = {};
+
+            VALID_TOUR_OPTION_FIELDS.forEach(field => {
+              // Only include field if it has a value (exclude null/undefined)
+              // This prevents Prisma from trying to validate columns that might not exist yet in production
+              if (field in opt && opt[field] !== undefined && opt[field] !== null) {
+                cleanOpt[field] = opt[field];
+              }
+            });
+
+            // Explicitly remove any id-related fields (shouldn't exist, but be safe)
+            delete cleanOpt.id;
+            delete cleanOpt.tourId;
+            delete cleanOpt.tour_id;
+
+            // CRITICAL: Remove pricingType from cleanOpt as well (double safety)
+            delete cleanOpt.pricingType;
+            delete cleanOpt.pricing_type;
+
+            // Log if we found any id fields in the original
+            if (opt.id || opt.tourId || opt.tour_id) {
+              console.warn(`⚠️  Option ${idx + 1} had id fields, removed:`, {
+                id: opt.id,
+                tourId: opt.tourId,
+                tour_id: opt.tour_id
+              });
+            }
+
+            // Log if we're removing any unexpected fields
+            const removedFields = Object.keys(opt).filter(key => !VALID_TOUR_OPTION_FIELDS.includes(key) && key !== 'id' && key !== 'tourId' && key !== 'tour_id');
+            if (removedFields.length > 0) {
+              console.warn(`⚠️  Option ${idx + 1} had unexpected fields removed:`, removedFields);
+            }
+
+            return cleanOpt;
+          });
+        }
+
+        // CRITICAL: Check finalTourData for any invalid fields BEFORE creating cleanFinalTourData
+        const invalidFieldsInFinalTourData = Object.keys(finalTourData).filter(key => {
+          const keyLower = key.toLowerCase();
+          return (
+            keyLower.includes('pricing') ||
+            (keyLower.includes('group') && keyLower !== 'group') ||
+            (keyLower.includes('option') && key !== 'options') ||
+            key === 'tourOptions'
+          );
+        });
+
+        if (invalidFieldsInFinalTourData.length > 0) {
+          console.error(`❌ CRITICAL: Found invalid fields in finalTourData BEFORE cleaning: ${invalidFieldsInFinalTourData.join(', ')}`);
+          invalidFieldsInFinalTourData.forEach(field => {
+            console.error(`   Removing '${field}' from finalTourData`);
+            delete finalTourData[field];
+          });
+        }
+
+        // FINAL SAFETY CHECK: Remove ALL option-related fields that might have leaked in
+        // This is a last-ditch effort to ensure no invalid fields reach Prisma
+        const SAFE_TOUR_FIELDS = [
+          'supplierId', 'title', 'slug', 'country', 'city', 'category', 'locations',
+          'duration', 'pricePerPerson', 'currency', 'shortDescription', 'fullDescription',
+          'highlights', 'included', 'notIncluded', 'meetingPoint', 'guideType', 'tourTypes',
+          'images', 'languages', 'reviews', 'status', 'options',
+          'itineraryItems', 'detailedItinerary', 'visitorInfo', 'checklistItems', 'pickupIncluded',
+          'groupPricingTiers', 'groupPrice', 'maxGroupSize', 'activityProvider', 'externalActivityId'
+        ];
+
+        // Create a completely clean object with ONLY valid Tour model fields
+        // Use explicit field assignment to prevent any field leakage
+        const cleanFinalTourData = {
+          supplierId: finalTourData.supplierId,
+          title: finalTourData.title,
+          slug: finalTourData.slug,
+          country: finalTourData.country,
+          city: finalTourData.city,
+          category: finalTourData.category,
+          locations: finalTourData.locations,
+          duration: finalTourData.duration,
+          pricePerPerson: finalTourData.pricePerPerson,
+          currency: finalTourData.currency,
+          shortDescription: finalTourData.shortDescription,
+          fullDescription: finalTourData.fullDescription,
+          highlights: finalTourData.highlights,
+          included: finalTourData.included,
+          notIncluded: finalTourData.notIncluded,
+          meetingPoint: finalTourData.meetingPoint,
+          guideType: finalTourData.guideType,
+          tourTypes: finalTourData.tourTypes || null,
+          images: finalTourData.images,
+          languages: finalTourData.languages,
+          reviews: finalTourData.reviews,
+          status: finalTourData.status || 'draft',
+          itineraryItems: finalTourData.itineraryItems ? (typeof finalTourData.itineraryItems === 'string' ? finalTourData.itineraryItems : JSON.stringify(finalTourData.itineraryItems)) : null,
+          detailedItinerary: finalTourData.detailedItinerary || null,
+          visitorInfo: finalTourData.visitorInfo || null,
+          checklistItems: finalTourData.checklistItems || null,
+          groupPricingTiers: finalTourData.groupPricingTiers ? (typeof finalTourData.groupPricingTiers === 'string' ? finalTourData.groupPricingTiers : JSON.stringify(finalTourData.groupPricingTiers)) : null,
+          groupPrice: finalTourData.groupPrice || null,
+          maxGroupSize: finalTourData.maxGroupSize || null,
+          // Never leave this empty: the tour page falls back to 'GlobeWithLocals', which
+          // credited a supplier's tour to us (Mumbai Discovery Tours, 2026-09-19).
+          activityProvider: finalTourData.activityProvider || supplierDisplayName(supplierCheck) || null,
+          // Links the tour back to its source listing so prices can be checked
+          // against the operator's own rate later. See memory bulk-import-quality.
+          externalActivityId: finalTourData.externalActivityId || null
+        };
+
+        // Only add options if they exist and are properly formatted
+        // CRITICAL: Create a completely fresh options array to prevent any field leakage
+        if (finalTourData.options && finalTourData.options.create && Array.isArray(finalTourData.options.create)) {
+          cleanFinalTourData.options = {
+            create: finalTourData.options.create.map(opt => {
+              // CRITICAL: Remove pricingType FIRST before any processing (prevents P2022 errors)
+              delete opt.pricingType;
+              delete opt.pricing_type;
+
+              // Create a completely fresh object with ONLY valid TourOption fields
+              const freshOpt = {};
+              VALID_TOUR_OPTION_FIELDS.forEach(field => {
+                // Only include field if it has a value (exclude null/undefined)
+                // This prevents Prisma from trying to validate columns that might not exist yet in production
+                if (field in opt && opt[field] !== undefined && opt[field] !== null) {
+                  freshOpt[field] = opt[field];
+                }
+              });
+              // Explicitly remove any id-related fields
+              delete freshOpt.id;
+              delete freshOpt.tourId;
+              delete freshOpt.tour_id;
+
+              // CRITICAL: Remove pricingType from freshOpt as well (double safety)
+              delete freshOpt.pricingType;
+              delete freshOpt.pricing_type;
+
+              return freshOpt;
+            })
+          };
+        }
+
+        // Explicitly ensure NO pricingType or other invalid fields exist (pricingType removed from schema)
+        delete cleanFinalTourData.pricingType;
+        delete cleanFinalTourData.pricing_type;
+        delete cleanFinalTourData.tourOptions;
+
+        // Log what we're about to send
+        console.log('📤 Final tourData before Prisma create:', {
+          hasId: 'id' in cleanFinalTourData,
+          supplierId: cleanFinalTourData.supplierId,
+          title: cleanFinalTourData.title,
+          slug: cleanFinalTourData.slug,
+          optionsCount: cleanFinalTourData.options?.create?.length || 0,
+          optionsHaveIds: cleanFinalTourData.options?.create?.some(opt => 'id' in opt || 'tourId' in opt) || false,
+          allFields: Object.keys(cleanFinalTourData)
+        });
+
+        // Log first option details for debugging
+        if (cleanFinalTourData.options?.create && cleanFinalTourData.options.create.length > 0) {
+          console.log('📋 First option details:', JSON.stringify(cleanFinalTourData.options.create[0], null, 2));
+        }
+
+        // FINAL VALIDATION: Ensure no pricing-related fields exist at Tour level
+        // BUT PRESERVE groupPricingTiers, maxGroupSize, groupPrice - these are valid Tour fields!
+        const topLevelKeys = Object.keys(cleanFinalTourData);
+        const pricingFields = topLevelKeys.filter(key => {
+          const keyLower = key.toLowerCase();
+          // Skip valid Tour fields that contain "pricing" or "group" or "itinerary"
+          if (keyLower === 'grouppricingtiers' || keyLower === 'maxgroupsize' || keyLower === 'groupprice' || keyLower === 'itineraryitems' || keyLower === 'detaileditinerary') {
+            return false; // Keep these fields
+          }
+          // Remove pricingType and other invalid fields
+          return (keyLower.includes('pricing') && keyLower !== 'grouppricingtiers') ||
+            (keyLower.includes('option') && key !== 'options');
+        });
+        if (pricingFields.length > 0) {
+          console.error(`❌ CRITICAL: Found invalid pricing/option fields at Tour level: ${pricingFields.join(', ')}`);
+          pricingFields.forEach(field => delete cleanFinalTourData[field]);
+          console.log('   ✅ Removed these invalid fields before Prisma call');
+        }
+
+        // Log final structure to verify
+        console.log('🔍 Final Prisma data structure:', {
+          topLevelFields: Object.keys(cleanFinalTourData),
+          hasOptions: !!cleanFinalTourData.options,
+          optionsCount: cleanFinalTourData.options?.create?.length || 0,
+          firstOptionFields: cleanFinalTourData.options?.create?.[0] ? Object.keys(cleanFinalTourData.options.create[0]) : []
+        });
+
+        // ABSOLUTE FINAL CHECK: Serialize and parse to ensure no hidden properties
+        // CRITICAL: Deep clone to break ALL references and ensure clean data
+        let finalDataForPrisma = JSON.parse(JSON.stringify(cleanFinalTourData));
+
+        // CRITICAL: Remove pricingType from finalDataForPrisma recursively one more time
+        // BUT PRESERVE groupPricingTiers, maxGroupSize, groupPrice - these are valid Tour fields!
+        const removePricingTypeFromFinal = (obj) => {
+          if (obj === null || obj === undefined) return obj;
+          if (Array.isArray(obj)) {
+            return obj.map(item => removePricingTypeFromFinal(item));
+          }
+          if (typeof obj === 'object') {
+            const cleaned = {};
+            for (const [key, value] of Object.entries(obj)) {
+              const keyLower = key.toLowerCase();
+              if (keyLower === 'pricingtype' || keyLower === 'pricing_type') {
+                continue; // Skip pricingType fields
+              }
+              // CRITICAL: Preserve groupPricingTiers, maxGroupSize, groupPrice, itineraryItems - valid Tour fields!
+              if (keyLower === 'grouppricingtiers' || keyLower === 'maxgroupsize' || keyLower === 'groupprice' || keyLower === 'itineraryitems' || keyLower === 'detaileditinerary') {
+                cleaned[key] = value; // Keep as-is, don't recurse
+                continue;
+              }
+              cleaned[key] = removePricingTypeFromFinal(value);
+            }
+            return cleaned;
+          }
+          return obj;
+        };
+        finalDataForPrisma = removePricingTypeFromFinal(finalDataForPrisma);
+
+        // Check one more time for any invalid pricing-related fields
+        // BUT ALLOW valid Tour fields: groupPricingTiers, maxGroupSize, groupPrice
+        const finalCheck = Object.keys(finalDataForPrisma).filter(key => {
+          const keyLower = key.toLowerCase();
+          // Allow valid Tour fields
+          if (keyLower === 'grouppricingtiers' || keyLower === 'maxgroupsize' || keyLower === 'groupprice') {
+            return false; // These are valid, don't flag them
+          }
+          // Flag invalid fields
+          return (keyLower.includes('pricing') && keyLower !== 'grouppricingtiers') ||
+            (keyLower.includes('group') && key !== 'group' && keyLower !== 'maxgroupsize' && keyLower !== 'groupprice') ||
+            (keyLower.includes('option') && key !== 'options');
+        });
+
+        if (finalCheck.length > 0) {
+          console.error(`❌ ABSOLUTE FINAL CHECK FAILED: Found invalid fields: ${finalCheck.join(', ')}`);
+          console.error('   Full object keys:', Object.keys(finalDataForPrisma));
+          throw new Error(`Invalid fields detected in final data: ${finalCheck.join(', ')}`);
+        }
+
+        console.log('✅ Final data validated - no invalid fields found. Proceeding with Prisma create...');
+
+        // ONE MORE ABSOLUTE FINAL CHECK: Log the exact object being sent to Prisma
+        console.log('🔍 EXACT DATA BEING SENT TO PRISMA:', JSON.stringify(finalDataForPrisma, null, 2));
+
+        // Check if pricingType exists at the TOP LEVEL (it should only exist in nested options)
+        const topLevelHasPricingType = 'pricingType' in finalDataForPrisma || 'pricing_type' in finalDataForPrisma;
+        if (topLevelHasPricingType) {
+          console.error('❌ CRITICAL: pricingType found at TOP LEVEL of finalDataForPrisma!');
+          console.error('   Top level keys:', Object.keys(finalDataForPrisma));
+          console.error('   This should not happen. Aborting Prisma call.');
+          throw new Error('pricingType detected at top level - this should not happen');
+        }
+
+        // CRITICAL FIX: Create tour WITHOUT options first, then add options separately
+        // Use deep clone to completely break any references
+        // CRITICAL: Apply pricingType removal one more time before cloning
+        let tempData = JSON.parse(JSON.stringify(finalDataForPrisma));
+        // Remove pricingType recursively from tempData BUT PRESERVE groupPricingTiers
+        const removePricingTypeRecursive = (obj) => {
+          if (obj === null || obj === undefined) return obj;
+          if (Array.isArray(obj)) {
+            return obj.map(item => removePricingTypeRecursive(item));
+          }
+          if (typeof obj === 'object') {
+            const cleaned = {};
+            for (const [key, value] of Object.entries(obj)) {
+              const keyLower = key.toLowerCase();
+              if (keyLower === 'pricingtype' || keyLower === 'pricing_type') {
+                continue; // Skip pricingType fields
+              }
+              // CRITICAL: Preserve groupPricingTiers - it's a valid field!
+              if (keyLower === 'grouppricingtiers') {
+                cleaned[key] = value; // Keep as-is, don't recurse
+                continue;
+              }
+              cleaned[key] = removePricingTypeRecursive(value);
+            }
+            return cleaned;
+          }
+          return obj;
+        };
+        tempData = removePricingTypeRecursive(tempData);
+        const tourDataWithoutOptions = JSON.parse(JSON.stringify(tempData));
+
+        // CRITICAL: Extract options BEFORE deleting (deep clone breaks references)
+        let optionsToCreate = [];
+        if (tourDataWithoutOptions.options?.create) {
+          optionsToCreate = JSON.parse(JSON.stringify(tourDataWithoutOptions.options.create));
+        } else if (tourDataWithoutOptions.tourOptions) {
+          optionsToCreate = JSON.parse(JSON.stringify(tourDataWithoutOptions.tourOptions));
+        }
+
+        // CRITICAL: Aggressively remove ALL possible option-related fields
+        delete tourDataWithoutOptions.options;
+        delete tourDataWithoutOptions.tourOptions;
+        delete tourDataWithoutOptions.option;
+
+        // CRITICAL: Verify options are completely gone
+        if ('options' in tourDataWithoutOptions || 'tourOptions' in tourDataWithoutOptions) {
+          console.error('🚨 CRITICAL: options still exist after delete!');
+          console.error('   Keys:', Object.keys(tourDataWithoutOptions));
+          // Force remove again
+          delete tourDataWithoutOptions.options;
+          delete tourDataWithoutOptions.tourOptions;
+        }
+
+        // CRITICAL: Deep clean optionsToCreate - remove pricingType completely
+        if (Array.isArray(optionsToCreate) && optionsToCreate.length > 0) {
+          optionsToCreate = optionsToCreate.map((opt, idx) => {
+            if (!opt || typeof opt !== 'object') return opt;
+
+            // Deep clone to break any references
+            let cleaned = JSON.parse(JSON.stringify(opt));
+
+            // Remove pricingType in multiple ways
+            delete cleaned.pricingType;
+            delete cleaned.pricing_type;
+
+            // CRITICAL: Only remove pricingType, NOT groupPricingTiers!
+            // Remove any key that contains "pricing" EXCEPT groupPricingTiers
+            Object.keys(cleaned).forEach(key => {
+              const keyLower = key.toLowerCase();
+              if (keyLower.includes('pricing')) {
+                if (keyLower === 'grouppricingtiers') {
+                  // PRESERVE groupPricingTiers - this is the correct field!
+                  console.log(`✅ Preserving groupPricingTiers for option ${idx + 1}`);
+                } else {
+                  // Remove other pricing fields (like pricingType)
+                  console.warn(`⚠️  Removing pricing-related key from option ${idx + 1}: ${key}`);
+                  delete cleaned[key];
+                }
+              }
+            });
+
+            // Final verification
+            if ('pricingType' in cleaned || 'pricing_type' in cleaned) {
+              console.error(`🚨 CRITICAL: pricingType STILL EXISTS in option ${idx + 1} after all removals!`);
+              console.error('   Option keys:', Object.keys(cleaned));
+              // Force remove one more time
+              delete cleaned.pricingType;
+              delete cleaned.pricing_type;
+            }
+
+            return cleaned;
+          });
+          console.log('✅ Final pricingType removal from optionsToCreate completed');
+        }
+
+        console.log('🔍 Creating tour WITHOUT options first...');
+        console.log('   Tour data keys:', Object.keys(tourDataWithoutOptions));
+        console.log('   Has options field?', 'options' in tourDataWithoutOptions);
+        console.log('   Has tourOptions field?', 'tourOptions' in tourDataWithoutOptions);
+        console.log('   Options to create separately:', optionsToCreate.length);
+        console.log('   Final slug:', tourDataWithoutOptions.slug);
+
+        // CRITICAL: Verify no pricingType in optionsToCreate (but groupPricingTiers is OK)
+        const hasPricingType = optionsToCreate.some(opt => {
+          if (!opt || typeof opt !== 'object') return false;
+          return 'pricingType' in opt || 'pricing_type' in opt ||
+            Object.keys(opt).some(k => {
+              const kLower = k.toLowerCase();
+              return kLower.includes('pricing') && kLower !== 'grouppricingtiers';
+            });
+        });
+        if (hasPricingType) {
+          console.error('🚨 CRITICAL: pricingType still found in optionsToCreate!');
+          console.error('   Options:', JSON.stringify(optionsToCreate, null, 2));
+          // Force remove with another deep clone
+          optionsToCreate = JSON.parse(JSON.stringify(optionsToCreate)).map(opt => {
+            if (opt && typeof opt === 'object') {
+              delete opt.pricingType;
+              delete opt.pricing_type;
+              Object.keys(opt).forEach(k => {
+                const kLower = k.toLowerCase();
+                // CRITICAL: Only remove pricingType, NOT groupPricingTiers!
+                if (kLower.includes('pricing') && kLower !== 'grouppricingtiers') {
+                  delete opt[k];
+                }
+              });
+            }
+            return opt;
+          });
+        }
+
+        // ABSOLUTE FINAL CHECK: Ensure no options field exists
+        if ('options' in tourDataWithoutOptions) {
+          console.error('🚨 CRITICAL: options field STILL EXISTS right before Prisma create!');
+          console.error('   Keys:', Object.keys(tourDataWithoutOptions));
+          delete tourDataWithoutOptions.options;
+        }
+
+        // Log exactly what we're sending to Prisma
+        console.log('═══════════════════════════════════════════════════════════');
+        console.log('🔍 FINAL CHECK BEFORE prisma.tour.create()');
+        console.log('═══════════════════════════════════════════════════════════');
+        console.log('📋 tourDataWithoutOptions keys:', Object.keys(tourDataWithoutOptions));
+        console.log('❓ Has options?', 'options' in tourDataWithoutOptions);
+        console.log('❓ Has tourOptions?', 'tourOptions' in tourDataWithoutOptions);
+        console.log('📦 Full object:', JSON.stringify(tourDataWithoutOptions, null, 2));
+        console.log('═══════════════════════════════════════════════════════════');
+
+        // CRITICAL: Final uniqueness check right before creation (prevents P2002 errors)
+        // This is a safety net - slug should already be unique from generation logic above
+        const originalSlug = tourDataWithoutOptions.slug;
+        let finalSlug = originalSlug;
+        let emergencyAttempts = 0;
+        const MAX_EMERGENCY_ATTEMPTS = 10;
+        let slugIsUnique = false;
+
+        while (emergencyAttempts < MAX_EMERGENCY_ATTEMPTS && !slugIsUnique) {
+          const finalSlugCheck = await prisma.tour.findUnique({
+            where: { slug: finalSlug }
+          });
+
+          if (!finalSlugCheck) {
+            // Slug is unique! Update and proceed
+            tourDataWithoutOptions.slug = finalSlug;
+            slugIsUnique = true;
+            if (emergencyAttempts > 0) {
+              console.log(`✅ Emergency slug generated after ${emergencyAttempts} attempts:`, finalSlug);
+            }
+            break;
+          }
+
+          // Collision detected - generate new emergency slug using ORIGINAL slug as base
+          emergencyAttempts++;
+          console.warn(`⚠️  Slug collision detected (attempt ${emergencyAttempts}/${MAX_EMERGENCY_ATTEMPTS}):`, finalSlug);
+
+          // Use original slug as base, not the colliding one
+          const timestamp = Date.now();
+          const random = Math.random().toString(36).slice(-6);
+          finalSlug = `${originalSlug}-${timestamp}-${random}`;
+
+          // Small delay to ensure different timestamp
+          if (emergencyAttempts < MAX_EMERGENCY_ATTEMPTS) {
+            await new Promise(resolve => setTimeout(resolve, 10));
+          }
+        }
+
+        // If we exhausted all attempts, use the last generated slug (should be unique due to timestamp)
+        if (!slugIsUnique && emergencyAttempts >= MAX_EMERGENCY_ATTEMPTS) {
+          // Generate one final guaranteed unique slug
+          const absoluteFinal = `${originalSlug}-${Date.now()}-${Math.random().toString(36).slice(-10)}`;
+          tourDataWithoutOptions.slug = absoluteFinal;
+          console.error('🚨 Used absolute final emergency slug after all attempts:', absoluteFinal);
+
+          // One more verification
+          const lastCheck = await prisma.tour.findUnique({
+            where: { slug: absoluteFinal }
+          });
+          if (lastCheck) {
+            // This should NEVER happen, but if it does, use microsecond precision
+            const microsecondSlug = `${originalSlug}-${Date.now()}-${process.hrtime.bigint().toString(36)}-${Math.random().toString(36).slice(-10)}`;
+            tourDataWithoutOptions.slug = microsecondSlug;
+            console.error('🚨 CRITICAL: Even absolute final slug collided! Using microsecond precision:', microsecondSlug);
+          }
+        }
+
+        // ABSOLUTE FINAL CHECK: Ensure no options field exists
+        if ('options' in tourDataWithoutOptions) {
+          console.error('🚨 CRITICAL: options field STILL EXISTS right before Prisma create!');
+          console.error('   Keys:', Object.keys(tourDataWithoutOptions));
+          delete tourDataWithoutOptions.options;
+        }
+
+        // Create the tour first (without options to prevent schema validation issues)
+        // Retry logic for connection errors (P1017, P1001, P1008)
+        let createAttempts = 0;
+        const MAX_CREATE_RETRIES = 3;
+        let tourCreated = false;
+
+        while (createAttempts < MAX_CREATE_RETRIES && !tourCreated) {
+          try {
+            tour = await prisma.tour.create({
+              data: tourDataWithoutOptions
+              // Don't include options here - we'll fetch them after creating separately
+            });
+            tourCreated = true;
+            break; // Success!
+          } catch (prismaError) {
+            createAttempts++;
+            console.error('═══════════════════════════════════════════════════════════');
+            console.error(`🚨 PRISMA ERROR DURING tour.create() (attempt ${createAttempts}/${MAX_CREATE_RETRIES})`);
+            console.error('═══════════════════════════════════════════════════════════');
+            console.error('Error code:', prismaError.code);
+            console.error('Error message:', prismaError.message);
+            console.error('Error meta:', JSON.stringify(prismaError.meta, null, 2));
+
+            // Retry on connection errors
+            if (createAttempts < MAX_CREATE_RETRIES && (
+              prismaError.code === 'P1017' ||
+              prismaError.code === 'P1001' ||
+              prismaError.code === 'P1008' ||
+              prismaError.message?.includes('connection') ||
+              prismaError.message?.includes('closed')
+            )) {
+              const retryDelay = createAttempts * 1000; // 1s, 2s, 3s
+              console.log(`   Connection error detected, retrying in ${retryDelay}ms...`);
+              await new Promise(resolve => setTimeout(resolve, retryDelay));
+              continue; // Retry
+            }
+
+            // Not a retryable error or max retries reached
+            console.error('Data sent to Prisma:', JSON.stringify(tourDataWithoutOptions, null, 2));
+            console.error('Has options?', 'options' in tourDataWithoutOptions);
+            console.error('All keys:', Object.keys(tourDataWithoutOptions));
+            console.error('═══════════════════════════════════════════════════════════');
+            throw prismaError;
+          }
+        }
+
+        if (!tourCreated) {
+          throw new Error('Failed to create tour after retries due to connection issues');
+        }
+
+        // Then create options separately if they exist
+        if (optionsToCreate.length > 0) {
+          console.log('🔍 Creating options separately...');
+
+          // Filter to only valid TourOption fields
+          // Note: pricingType removed - we infer pricing type from groupPrice/maxGroupSize presence
+
+          // CRITICAL: Reset tour_options sequence if ID conflict detected
+          // createMany can have sequence synchronization issues
+          try {
+            await prisma.$queryRaw`SELECT setval('tour_options_id_seq', COALESCE((SELECT MAX(id) FROM tour_options), 0) + 1, false)`;
+            console.log('✅ tour_options_id_seq synchronized');
+          } catch (seqError) {
+            console.warn('⚠️  Could not reset tour_options sequence (non-critical):', seqError.message);
+          }
+
+          // CRITICAL: Create options one by one instead of createMany to avoid sequence issues
+          // This is more reliable than createMany with sequence resets
+          const createdOptions = [];
+          for (let i = 0; i < optionsToCreate.length; i++) {
+            const opt = optionsToCreate[i];
+
+            // CRITICAL: Remove pricingType FIRST before any processing (prevents P2022 errors)
+            // This field does NOT exist in the database and MUST be removed
+            delete opt.pricingType;
+            delete opt.pricing_type;
+
+            const cleanOpt = {};
+
+            // Only include valid fields (maxGroupSize and groupPrice are EXCLUDED from VALID_TOUR_OPTION_FIELDS)
+            VALID_TOUR_OPTION_FIELDS.forEach(field => {
+              // Only include field if it has a value (exclude null/undefined)
+              // This prevents Prisma from trying to validate columns that might not exist yet
+              if (opt[field] !== undefined && opt[field] !== null) {
+                // CRITICAL: For groupPricingTiers, ensure it's a string
+                if (field === 'groupPricingTiers') {
+                  if (typeof opt[field] === 'string') {
+                    cleanOpt[field] = opt[field];
+                    console.log(`✅ Option ${i + 1} groupPricingTiers (string):`, opt[field].substring(0, 200));
+                  } else if (Array.isArray(opt[field])) {
+                    cleanOpt[field] = JSON.stringify(opt[field]);
+                    console.log(`✅ Option ${i + 1} groupPricingTiers (array->string):`, JSON.stringify(opt[field]).substring(0, 200));
+                  } else {
+                    console.warn(`⚠️ Option ${i + 1} groupPricingTiers has unexpected type:`, typeof opt[field]);
+                  }
+                } else {
+                  cleanOpt[field] = opt[field];
+                }
+              } else if (field === 'groupPricingTiers') {
+                console.warn(`⚠️ Option ${i + 1} has NO groupPricingTiers (null/undefined)`);
+              }
+            });
+
+            // CRITICAL: Explicitly remove maxGroupSize and groupPrice to prevent Prisma validation
+            // These columns may not exist in production DB if migration hasn't been run
+            // They are NOT in VALID_TOUR_OPTION_FIELDS, so they won't be added above
+            // But we explicitly remove them here as a safety measure
+            delete cleanOpt.maxGroupSize;
+            delete cleanOpt.max_group_size;
+            delete cleanOpt.groupPrice;
+            delete cleanOpt.group_price;
+
+            // Log if we're skipping group pricing fields (for debugging)
+            if (opt.maxGroupSize || opt.groupPrice) {
+              console.log(`   ℹ️  Skipping group pricing fields for option ${i + 1} (columns may not exist in DB)`);
+            }
+
+            // CRITICAL: Aggressively remove ALL possible ID fields
+            delete cleanOpt.id;
+            delete cleanOpt.tourId;
+            delete cleanOpt.tour_id;
+            delete cleanOpt.optionId;
+            delete cleanOpt.option_id;
+
+            // CRITICAL: Remove pricingType from cleanOpt as well (double safety)
+            delete cleanOpt.pricingType;
+            delete cleanOpt.pricing_type;
+
+            // Remove any other ID-like fields
+            Object.keys(cleanOpt).forEach(key => {
+              const keyLower = key.toLowerCase();
+              if (keyLower === 'id' || (keyLower.includes('id') && (keyLower.includes('tour') || keyLower.includes('option')))) {
+                delete cleanOpt[key];
+              }
+              // CRITICAL: DO NOT remove groupPricingTiers! Only remove pricingType
+              // Also remove any pricing-related fields EXCEPT groupPricingTiers
+              if (keyLower.includes('pricing')) {
+                if (keyLower === 'grouppricingtiers') {
+                  // Keep groupPricingTiers - this is the correct field
+                  console.log(`✅ Preserving groupPricingTiers for option ${i + 1}`);
+                } else {
+                  // Remove other pricing fields (like pricingType)
+                  console.log(`🗑️ Removing pricing field "${key}" from option ${i + 1}`);
+                  delete cleanOpt[key];
+                }
+              }
+            });
+
+            // CRITICAL: Final verification - log if groupPricingTiers exists
+            if (cleanOpt.groupPricingTiers) {
+              console.log(`✅ Option ${i + 1} FINAL CHECK - groupPricingTiers PRESENT:`,
+                typeof cleanOpt.groupPricingTiers === 'string'
+                  ? cleanOpt.groupPricingTiers.substring(0, 200)
+                  : 'not string');
+            } else {
+              console.warn(`⚠️ Option ${i + 1} FINAL CHECK - groupPricingTiers MISSING!`);
+            }
+
+            // Final check: Log if pricingType somehow still exists
+            if ('pricingType' in cleanOpt || 'pricing_type' in cleanOpt) {
+              console.error('🚨 CRITICAL: pricingType still exists in cleanOpt after all removals!');
+              console.error('   cleanOpt keys:', Object.keys(cleanOpt));
+              delete cleanOpt.pricingType;
+              delete cleanOpt.pricing_type;
+            }
+
+            // Create option individually (more reliable than createMany)
+            // CRITICAL: Handle missing column errors gracefully (migration might not be run yet)
+            try {
+              // CRITICAL: Log what we're about to save
+              console.log(`📤 Creating option ${i + 1} with data:`, {
+                optionTitle: cleanOpt.optionTitle,
+                price: cleanOpt.price,
+                hasGroupPricingTiers: !!cleanOpt.groupPricingTiers,
+                groupPricingTiersType: typeof cleanOpt.groupPricingTiers,
+                groupPricingTiersPreview: cleanOpt.groupPricingTiers
+                  ? (typeof cleanOpt.groupPricingTiers === 'string'
+                    ? cleanOpt.groupPricingTiers.substring(0, 200)
+                    : JSON.stringify(cleanOpt.groupPricingTiers).substring(0, 200))
+                  : 'null',
+                allKeys: Object.keys(cleanOpt),
+                groupPricingTiersKeyExists: 'groupPricingTiers' in cleanOpt
+              });
+
+              const createdOption = await prisma.tourOption.create({
+                data: {
+                  ...cleanOpt,
+                  tourId: tour.id
+                }
+              });
+
+              // CRITICAL: Verify what was actually saved
+              console.log(`✅ Option ${i + 1} created successfully:`, {
+                id: createdOption.id,
+                optionTitle: createdOption.optionTitle,
+                hasGroupPricingTiers: !!createdOption.groupPricingTiers,
+                groupPricingTiersType: typeof createdOption.groupPricingTiers,
+                groupPricingTiersPreview: createdOption.groupPricingTiers
+                  ? (typeof createdOption.groupPricingTiers === 'string'
+                    ? createdOption.groupPricingTiers.substring(0, 200)
+                    : 'not string')
+                  : 'null',
+                verification: createdOption.groupPricingTiers ? '✅ SAVED' : '❌ MISSING'
+              });
+
+              createdOptions.push(createdOption);
+            } catch (optionError) {
+              // If error is about missing max_group_size or group_price columns, retry without them
+              if (optionError.code === 'P2022' &&
+                (optionError.meta?.column?.includes('max_group_size') ||
+                  optionError.meta?.column?.includes('group_price'))) {
+                console.warn(`⚠️  Column missing for option ${i + 1}, retrying without group pricing fields...`);
+                // Remove group pricing fields and retry
+                const fallbackOpt = { ...cleanOpt };
+                delete fallbackOpt.maxGroupSize;
+                delete fallbackOpt.groupPrice;
+                delete fallbackOpt.max_group_size;
+                delete fallbackOpt.group_price;
+
+                try {
+                  const createdOption = await prisma.tourOption.create({
+                    data: {
+                      ...fallbackOpt,
+                      tourId: tour.id
+                    }
+                  });
+                  createdOptions.push(createdOption);
+                  console.log(`✅ Created option ${i + 1} without group pricing fields (migration may need to be run)`);
+                } catch (fallbackError) {
+                  console.error(`❌ Failed to create option ${i + 1} even without group pricing:`, fallbackError.message);
+                  throw fallbackError; // Re-throw if fallback also fails
+                }
+              } else {
+                // Other errors should be thrown normally
+                throw optionError;
+              }
+            }
+          }
+
+          console.log(`✅ Created ${createdOptions.length} tour options individually`);
+
+          // Fetch the tour again with options
+          tour = await prisma.tour.findUnique({
+            where: { id: tour.id },
+            include: {
+              options: {
+                orderBy: {
+                  sortOrder: 'asc'
+                }
+              }
+            }
+          });
+        }
+        break; // Success, exit retry loop
+      } catch (createError) {
+        createAttempts++;
+
+        // ENHANCED ERROR LOGGING - Make errors super visible
+        console.error('\n');
+        console.error('═══════════════════════════════════════════════════════════');
+        console.error('🚨 TOUR CREATION ERROR DETECTED 🚨');
+        console.error('═══════════════════════════════════════════════════════════');
+        console.error(`❌ Attempt ${createAttempts}/${MAX_CREATE_RETRIES} failed`);
+        console.error('');
+        console.error('📋 ERROR DETAILS:');
+        console.error('   Message:', createError.message);
+        console.error('   Code:', createError.code || 'N/A');
+        console.error('   Meta:', JSON.stringify(createError.meta, null, 2));
+        console.error('');
+        console.error('📚 FULL ERROR STACK:');
+        console.error(createError.stack || createError);
+        console.error('═══════════════════════════════════════════════════════════');
+        console.error('\n');
+
+        // If it's an ID constraint violation, this is unusual - log more details
+        if (createError.code === 'P2002' && createError.meta?.target?.includes('id')) {
+          console.error('   ⚠️  ID constraint violation detected!');
+          console.error('   This should not happen if id is auto-generated.');
+          if (finalTourData) {
+            console.error('   Checking if id field exists in finalTourData...');
+            console.error('   finalTourData keys:', Object.keys(finalTourData));
+            console.error('   Has id field:', 'id' in finalTourData);
+          }
+
+          // This is likely a database sequence issue - try to reset it
+          if (createAttempts < MAX_CREATE_RETRIES) {
+            console.log(`   ID conflict detected, attempting to reset sequence and retry (attempt ${createAttempts + 1}/${MAX_CREATE_RETRIES})...`);
+            try {
+              // Attempt to reset the sequence for the 'tours' table
+              await prisma.$queryRaw`SELECT setval('tours_id_seq', (SELECT MAX(id) FROM tours))`;
+              console.log('   ✅ tours_id_seq reset successfully.');
+            } catch (seqError) {
+              console.error('   ❌ Failed to reset tours_id_seq:', seqError.message);
+            }
+            // Wait longer for ID conflicts (might be sequence sync issue)
+            await new Promise(resolve => setTimeout(resolve, (createAttempts + 1) * 1000));
+            continue;
+          } else {
+            // Max retries reached - return error with suggestion to check database
+            return res.status(500).json({
+              success: false,
+              error: 'Database error',
+              message: 'Failed to create tour due to database sequence issue. Please contact support or try again later.',
+              details: process.env.NODE_ENV === 'development' ? {
+                code: createError.code,
+                meta: createError.meta,
+                message: createError.message,
+                suggestion: 'Database sequence may be out of sync. Run: SELECT setval(\'tours_id_seq\', (SELECT MAX(id) FROM tours));'
+              } : undefined
+            });
+          }
+        }
+
+        // If it's any other constraint violation and we have retries left, try again
+        if (createError.code === 'P2002' && createAttempts < MAX_CREATE_RETRIES) {
+          console.log(`   Constraint violation detected, retrying in ${createAttempts * 500}ms...`);
+          await new Promise(resolve => setTimeout(resolve, createAttempts * 500));
+          continue;
+        }
+
+        // If it's a slug conflict, regenerate slug and retry
+        if (createError.code === 'P2002' && createError.meta?.target?.includes('slug') && createAttempts < MAX_CREATE_RETRIES) {
+          console.log(`   Slug conflict detected, regenerating slug...`);
+          // Regenerate slug with timestamp to ensure uniqueness
+          const timestamp = Date.now();
+          const baseSlug = tourData.slug.split('-').slice(0, -1).join('-'); // Remove any existing suffix
+          tourData.slug = `${baseSlug}-${timestamp}`;
+          console.log(`   New slug: ${tourData.slug}`);
+          await new Promise(resolve => setTimeout(resolve, createAttempts * 500));
+          continue;
+        }
+
+        // If it's an options-related error and we have retries left, try creating without options
+        if (createError.message?.includes('option') || createError.message?.includes('tour_option') || createError.code === 'P2003') {
+          console.log(`   ⚠️  Options-related error detected, attempting to create tour without options...`);
+          try {
+            // Remove options and try again
+            const tourDataWithoutOptions = { ...finalTourData };
+            delete tourDataWithoutOptions.options;
+
+            tour = await prisma.tour.create({
+              data: tourDataWithoutOptions,
+              include: {
+                options: true
+              }
+            });
+            console.log(`   ✅ Tour created successfully without options (options can be added later)`);
+            break; // Success without options
+          } catch (noOptionsError) {
+            console.error(`   ❌ Failed to create tour even without options:`, noOptionsError.message);
+            // Continue to throw original error
+          }
+        }
+
+        // Not a retryable error or max retries reached, throw
+        throw createError;
+      }
+    }
+
+    if (!tour) {
+      throw new Error('Failed to create tour after retries');
+    }
+
+    const totalTime = Date.now() - createStartTime;
+    console.log(`✅ Tour created successfully: ${tour.id} (took ${totalTime}ms)`);
+
+    if (totalTime > 10000) {
+      console.warn(`⚠️ Slow tour creation detected (${totalTime}ms)`);
+    }
+    console.log(`   Title: ${tour.title}`);
+    console.log(`   Slug: ${tour.slug}`);
+    console.log(`   City: ${tour.city}, ${tour.country}`);
+    console.log(`   Options: ${tour.options ? tour.options.length : 0}`);
+    if (tour.options && tour.options.length > 0) {
+      console.log(`   📋 Options details:`);
+      tour.options.forEach((opt, idx) => {
+        console.log(`      ${idx + 1}. ${opt.optionTitle} - ${opt.currency}${opt.price} (${opt.durationHours}h)`);
+      });
+    } else {
+      console.log(`   ⚠️  No options were saved!`);
+    }
+    console.log(`   Status: ${tour.status}`);
+    console.log(`   URL: /${tour.country.toLowerCase().replace(/\s+/g, '-')}/${tour.city.toLowerCase().replace(/\s+/g, '-')}/${tour.slug}`);
+
+    // Upload images to R2 in background (non-blocking)
+    if (needsR2Upload) {
+      console.log(`☁️  Starting background R2 upload for tour ${tour.id}...`);
+      uploadImagesInBackground(tour.id, imagesArray, city).catch(error => {
+        console.error(`❌ Background R2 upload failed for tour ${tour.id}:`, error.message);
+      });
+    }
+
+    // Use centralized helper function to ensure reviews is always null
+    res.json({
+      success: true,
+      message: 'Tour created successfully',
+      tour: formatTourResponse(tour, {
+        locations: locationsArray,
+        images: imagesArray,
+        languages: languagesArray,
+        highlights: highlightsArray
+      })
+    });
+  } catch (error) {
+    console.error('❌ Tour creation error:', error);
+    console.error('❌ Error stack:', error.stack);
+    console.error('❌ Error message:', error.message);
+    console.error('❌ Error code:', error.code);
+    console.error('❌ Error meta:', JSON.stringify(error.meta, null, 2));
+    console.error('❌ Full error object:', JSON.stringify(error, Object.getOwnPropertyNames(error), 2));
+
+    // Handle specific Prisma errors
+    let errorMessage = 'Failed to create tour. Please check all required fields and try again.';
+    let commonIssues = [];
+
+    // Check for Prisma validation errors (P2003, P2011, etc.)
+    if (error.code === 'P2003') {
+      errorMessage = 'Invalid supplier or foreign key constraint violation. Please make sure you are logged in with an approved account.';
+      commonIssues = [
+        'Your supplier account needs admin approval',
+        'Log out and log back in',
+        'Contact support if the issue persists'
+      ];
+    } else if (error.code === 'P2011') {
+      // Null constraint violation
+      const field = error.meta?.target?.[0] || 'unknown field';
+      errorMessage = `Missing required field: ${field}. Please check all required fields are filled.`;
+      commonIssues = [
+        'Check that all tour option fields are filled',
+        'Ensure optionTitle, optionDescription, price, and durationHours are provided for each option'
+      ];
+    } else if (error.code === 'P2012') {
+      // Missing required value
+      const field = error.meta?.path || 'unknown field';
+      errorMessage = `Missing required value for field: ${field}. Please check all required fields.`;
+      commonIssues = [
+        'Check that all tour option fields are filled',
+        'Ensure optionTitle, optionDescription, price, and durationHours are provided'
+      ];
+    } else if (error.code === 'P2002') {
+      // Unique constraint violation
+      if (error.meta?.target?.includes('id')) {
+        errorMessage = 'Database error: ID conflict. Please try again.';
+        commonIssues = [
+          'Your supplier account needs admin approval',
+          'Check all required fields are filled',
+          'Ensure you have at least 4 images uploaded',
+          'Try refreshing the page and submitting again'
+        ];
+      } else if (error.meta?.target?.includes('slug')) {
+        errorMessage = 'A tour with this title already exists. Please use a different title.';
+        commonIssues = [
+          'Try adding more details to your tour title',
+          'Check if you already created this tour'
+        ];
+      } else {
+        errorMessage = 'A record with this information already exists.';
+      }
+    } else if (error.code === 'P2003') {
+      errorMessage = 'Invalid supplier. Please make sure you are logged in with an approved account.';
+      commonIssues = [
+        'Your supplier account needs admin approval',
+        'Log out and log back in',
+        'Contact support if the issue persists'
+      ];
+    }
+
+    // Return detailed error message (FORCE ENABLED FOR DEBUGGING)
+    const finalMessage = error.message || errorMessage;
+
+    // ENHANCED ERROR RESPONSE - Show detailed errors
+    const errorResponse = {
+      success: false,
+      error: 'Internal server error',
+      message: finalMessage,
+      commonIssues: commonIssues.length > 0 ? commonIssues : undefined,
+      details: {
+        code: error.code,
+        message: error.message,
+        meta: error.meta,
+        stack: error.stack
+      }
+    };
+
+    // Log error to console with clear formatting
+    console.error('\n');
+    console.error('═══════════════════════════════════════════════════════════');
+    console.error('🚨 TOUR CREATION FAILED - RETURNING ERROR TO CLIENT 🚨');
+    console.error('═══════════════════════════════════════════════════════════');
+    console.error('Response:', JSON.stringify(errorResponse, null, 2));
+    console.error('═══════════════════════════════════════════════════════════');
+    console.error('\n');
+
+    res.status(500).json(errorResponse);
+  }
+});
+
+// Get mini tours for a supplier (for upsell selection)
+app.get('/api/suppliers/:supplierId/tours', async (req, res) => {
+  try {
+    const { supplierId } = req.params;
+    const { category } = req.query;
+
+    const where = {
+      supplierId: parseInt(supplierId)
+    };
+
+    if (category) {
+      where.category = category;
+    }
+
+    const tours = await prisma.tour.findMany({
+      where,
+      orderBy: {
+        createdAt: 'desc'
+      }
+    });
+
+    // Parse JSON fields
+    const formattedTours = tours.map(tour => ({
+      ...tour,
+      id: String(tour.id),
+      locations: JSON.parse(tour.locations || '[]'),
+      images: JSON.parse(tour.images || '[]'),
+      languages: JSON.parse(tour.languages || '[]'),
+      highlights: tour.highlights ? JSON.parse(tour.highlights || '[]') : []
+    }));
+
+    res.json({
+      success: true,
+      tours: formattedTours
+    });
+  } catch (error) {
+    console.error('Get supplier tours error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to fetch tours'
+    });
+  }
+});
+
+// Get all tours for a supplier
+app.get('/api/tours', async (req, res) => {
+  const startTime = Date.now();
+  try {
+    const { supplierId } = req.query;
+
+    if (!supplierId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing supplierId',
+        message: 'Please provide supplierId as query parameter'
+      });
+    }
+
+    console.log(`📋 Fetching tours for supplier ${supplierId}`);
+
+    // Retry logic for Render free tier database connection issues
+    let tours = null;
+    let findAttempts = 0;
+    const MAX_FIND_RETRIES = 3;
+
+    while (findAttempts < MAX_FIND_RETRIES && !tours) {
+      try {
+        // Optimize query: only select necessary fields and limit options
+        tours = await prisma.tour.findMany({
+          where: {
+            supplierId: parseInt(supplierId)
+          },
+          select: {
+            id: true,
+            supplierId: true,
+            title: true,
+            slug: true,
+            country: true,
+            city: true,
+            category: true,
+            locations: true,
+            duration: true,
+            pricePerPerson: true,
+            currency: true,
+            shortDescription: true,
+            fullDescription: true,
+            highlights: true,
+            included: true,
+            notIncluded: true,
+            meetingPoint: true,
+            guideType: true,
+            tourTypes: true,
+            // Don't fetch images for list view - they're huge base64 strings and slow down queries significantly
+            // Images will be fetched separately when viewing individual tours
+            // images: true,
+            languages: true,
+            status: true,
+            rejectionReason: true,
+            maxGroupSize: true,
+            groupPrice: true,
+            createdAt: true,
+            updatedAt: true,
+            approvedAt: true,
+            options: {
+              select: {
+                id: true,
+                tourId: true,
+                optionTitle: true,
+                optionDescription: true,
+                durationHours: true,
+                price: true,
+                currency: true,
+                language: true,
+                pickupIncluded: true,
+                entryTicketIncluded: true,
+                guideIncluded: true,
+                carIncluded: true,
+                groupPricingTiers: true,
+                sortOrder: true
+              },
+              orderBy: {
+                sortOrder: 'asc'
+              }
+            }
+          },
+          orderBy: {
+            createdAt: 'desc'
+          }
+        });
+        break; // Success, exit retry loop
+      } catch (dbError) {
+        findAttempts++;
+        console.error(`   Database error fetching tours (attempt ${findAttempts}/${MAX_FIND_RETRIES}):`, dbError.message);
+
+        // If it's a connection error and we have retries left, wait and retry
+        if (findAttempts < MAX_FIND_RETRIES && (
+          dbError.message?.includes('connection') ||
+          dbError.message?.includes('timeout') ||
+          dbError.code === 'P1001' ||
+          dbError.code === 'P1017' ||
+          dbError.code === 'P1008'
+        )) {
+          console.log(`   Retrying in ${findAttempts * 500}ms...`);
+          await new Promise(resolve => setTimeout(resolve, findAttempts * 500));
+          continue;
+        }
+        // Not a retryable error, throw
+        throw dbError;
+      }
+    }
+
+    if (!tours) {
+      throw new Error('Failed to fetch tours after retries');
+    }
+
+    const queryTime = Date.now() - startTime;
+    console.log(`   ✅ Found ${tours.length} tours (query took ${queryTime}ms)`);
+
+    // Parse JSON fields with error handling
+    const parseStartTime = Date.now();
+    const formattedTours = tours.map(tour => {
+      try {
+        // Format options
+        const formattedOptions = (tour.options || []).map(opt => {
+          // Parse groupPricingTiers if it exists (stored as JSON string in DB)
+          let groupPricingTiers = null;
+          if (opt.groupPricingTiers) {
+            try {
+              groupPricingTiers = typeof opt.groupPricingTiers === 'string'
+                ? JSON.parse(opt.groupPricingTiers)
+                : opt.groupPricingTiers;
+            } catch (e) {
+              console.warn(`   ⚠️  Failed to parse groupPricingTiers for option ${opt.id}:`, e.message);
+              groupPricingTiers = null;
+            }
+          }
+
+          return {
+            id: String(opt.id),
+            tourId: String(opt.tourId),
+            optionTitle: opt.optionTitle,
+            optionDescription: opt.optionDescription,
+            durationHours: opt.durationHours,
+            price: opt.price,
+            currency: opt.currency,
+            language: opt.language,
+            pickupIncluded: opt.pickupIncluded,
+            entryTicketIncluded: opt.entryTicketIncluded,
+            guideIncluded: opt.guideIncluded,
+            carIncluded: opt.carIncluded,
+            maxGroupSize: opt.maxGroupSize,
+            groupPrice: opt.groupPrice,
+            groupPricingTiers: groupPricingTiers,
+            sortOrder: opt.sortOrder
+          };
+        });
+
+        return {
+          ...tour,
+          id: String(tour.id),
+          supplierId: String(tour.supplierId),
+          locations: JSON.parse(tour.locations || '[]'),
+          images: tour.images ? JSON.parse(tour.images || '[]') : [], // Handle missing images field
+          languages: JSON.parse(tour.languages || '[]'),
+          highlights: tour.highlights ? JSON.parse(tour.highlights || '[]') : [],
+          tourTypes: tour.tourTypes ? JSON.parse(tour.tourTypes || '[]') : [],
+          options: formattedOptions
+        };
+      } catch (parseError) {
+        console.warn(`   ⚠️  Error parsing tour ${tour.id} JSON fields:`, parseError.message);
+        return {
+          ...tour,
+          id: String(tour.id),
+          supplierId: String(tour.supplierId),
+          locations: [],
+          images: [], // Images not fetched for list view
+          languages: ['English'],
+          highlights: [],
+          tourTypes: [],
+          options: (tour.options || []).map(opt => ({
+            id: String(opt.id),
+            tourId: String(opt.tourId),
+            optionTitle: opt.optionTitle,
+            optionDescription: opt.optionDescription,
+            durationHours: opt.durationHours,
+            price: opt.price,
+            currency: opt.currency,
+            language: opt.language,
+            pickupIncluded: opt.pickupIncluded,
+            entryTicketIncluded: opt.entryTicketIncluded,
+            guideIncluded: opt.guideIncluded,
+            carIncluded: opt.carIncluded,
+            groupPricingTiers: opt.groupPricingTiers ? (typeof opt.groupPricingTiers === 'string' ? JSON.parse(opt.groupPricingTiers) : opt.groupPricingTiers) : null,
+            sortOrder: opt.sortOrder
+          }))
+        };
+      }
+    });
+
+    const parseTime = Date.now() - parseStartTime;
+    const totalTime = Date.now() - startTime;
+    console.log(`   ✅ Formatted ${formattedTours.length} tours (parse: ${parseTime}ms, total: ${totalTime}ms)`);
+
+    // Log warning if query is slow
+    if (totalTime > 5000) {
+      console.warn(`⚠️ Slow tour fetch detected (${totalTime}ms) - query: ${queryTime}ms, parse: ${parseTime}ms`);
+    }
+
+    res.json({
+      success: true,
+      tours: formattedTours
+    });
+  } catch (error) {
+    const totalTime = Date.now() - startTime;
+    console.error(`❌ Get tours error (after ${totalTime}ms):`, error);
+    console.error('   Error message:', error.message);
+    console.error('   Error code:', error.code);
+    console.error('   Error stack:', error.stack);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to fetch tours',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Get single tour by ID
+app.get('/api/tours/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const tourId = parseInt(id);
+
+    if (isNaN(tourId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid tour ID',
+        message: 'Tour ID must be a valid number'
+      });
+    }
+
+    // Retry logic for Render free tier database connection issues
+    let tour = null;
+    let findAttempts = 0;
+    const MAX_FIND_RETRIES = 3;
+
+    while (findAttempts < MAX_FIND_RETRIES && !tour) {
+      try {
+        tour = await prisma.tour.findUnique({
+          where: { id: tourId },
+          include: {
+            options: {
+              orderBy: {
+                sortOrder: 'asc'
+              }
+            }
+          }
+        });
+        break; // Success, exit retry loop
+      } catch (dbError) {
+        findAttempts++;
+        console.error(`   Database error fetching tour (attempt ${findAttempts}/${MAX_FIND_RETRIES}):`, dbError.message);
+
+        // If it's a connection error and we have retries left, wait and retry
+        if (findAttempts < MAX_FIND_RETRIES && (
+          dbError.message?.includes('connection') ||
+          dbError.message?.includes('timeout') ||
+          dbError.code === 'P1001' ||
+          dbError.code === 'P1017' ||
+          dbError.code === 'P1008'
+        )) {
+          console.log(`   Retrying in ${findAttempts * 500}ms...`);
+          await new Promise(resolve => setTimeout(resolve, findAttempts * 500));
+          continue;
+        }
+        // Not a retryable error, throw
+        throw dbError;
+      }
+    }
+
+    if (!tour) {
+      return res.status(404).json({
+        success: false,
+        error: 'Tour not found',
+        message: 'No tour found with the provided ID'
+      });
+    }
+
+    // Parse JSON fields with error handling
+    let formattedTour;
+    try {
+      // Format options
+      const formattedOptions = (tour.options || []).map(opt => {
+        // Parse groupPricingTiers if it exists
+        let groupPricingTiers = null;
+        if (opt.groupPricingTiers) {
+          try {
+            groupPricingTiers = typeof opt.groupPricingTiers === 'string'
+              ? JSON.parse(opt.groupPricingTiers)
+              : opt.groupPricingTiers;
+          } catch (e) {
+            console.warn(`   ⚠️  Failed to parse groupPricingTiers for option ${opt.id}:`, e.message);
+            groupPricingTiers = null;
+          }
+        }
+
+        return {
+          id: String(opt.id),
+          tourId: String(opt.tourId),
+          optionTitle: opt.optionTitle,
+          optionDescription: opt.optionDescription,
+          durationHours: opt.durationHours,
+          price: opt.price,
+          currency: opt.currency,
+          language: opt.language,
+          pickupIncluded: opt.pickupIncluded,
+          entryTicketIncluded: opt.entryTicketIncluded,
+          guideIncluded: opt.guideIncluded,
+          carIncluded: opt.carIncluded,
+          maxGroupSize: opt.maxGroupSize,
+          groupPrice: opt.groupPrice,
+          groupPricingTiers: groupPricingTiers,
+          sortOrder: opt.sortOrder
+        };
+      });
+
+      // Parse groupPricingTiers for main tour if it exists
+      let groupPricingTiers = null;
+      if (tour.groupPricingTiers) {
+        try {
+          groupPricingTiers = typeof tour.groupPricingTiers === 'string'
+            ? JSON.parse(tour.groupPricingTiers)
+            : tour.groupPricingTiers;
+        } catch (e) {
+          console.warn(`   ⚠️  Failed to parse groupPricingTiers for tour ${tour.id}:`, e.message);
+          groupPricingTiers = null;
+        }
+      }
+
+      formattedTour = {
+        ...tour,
+        id: String(tour.id),
+        supplierId: String(tour.supplierId),
+        locations: JSON.parse(tour.locations || '[]'),
+        images: JSON.parse(tour.images || '[]'),
+        languages: JSON.parse(tour.languages || '[]'),
+        highlights: tour.highlights ? JSON.parse(tour.highlights || '[]') : [],
+        tourTypes: tour.tourTypes ? JSON.parse(tour.tourTypes || '[]') : [],
+        groupPricingTiers: groupPricingTiers,
+        options: formattedOptions
+      };
+    } catch (parseError) {
+      console.warn(`   ⚠️  Error parsing tour ${tour.id} JSON fields:`, parseError.message);
+      formattedTour = {
+        ...tour,
+        id: String(tour.id),
+        supplierId: String(tour.supplierId),
+        locations: [],
+        images: [],
+        languages: ['English'],
+        highlights: [],
+        options: (tour.options || []).map(opt => ({
+          id: String(opt.id),
+          tourId: String(opt.tourId),
+          optionTitle: opt.optionTitle,
+          optionDescription: opt.optionDescription,
+          durationHours: opt.durationHours,
+          price: opt.price,
+          currency: opt.currency,
+          language: opt.language,
+          pickupIncluded: opt.pickupIncluded,
+          entryTicketIncluded: opt.entryTicketIncluded,
+          guideIncluded: opt.guideIncluded,
+          carIncluded: opt.carIncluded,
+          maxGroupSize: opt.maxGroupSize,
+          groupPrice: opt.groupPrice,
+          sortOrder: opt.sortOrder
+        }))
+      };
+    }
+
+    res.json({
+      success: true,
+      tour: formattedTour
+    });
+  } catch (error) {
+    console.error('❌ Get tour error:', error);
+    console.error('   Error message:', error.message);
+    console.error('   Error code:', error.code);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to fetch tour',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Update tour (only if draft)
+app.put('/api/tours/:id', async (req, res) => {
+  const updateStartTime = Date.now();
+  try {
+    console.log(`📝 Tour update request received for tour ${req.params.id}`);
+    const { id } = req.params;
+    const tourId = parseInt(id);
+    const updateData = req.body;
+
+    if (isNaN(tourId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid tour ID',
+        message: 'Tour ID must be a valid number'
+      });
+    }
+
+    // Check if tour exists and is in draft status
+    const existingTour = await prisma.tour.findUnique({
+      where: { id: tourId }
+    });
+
+    if (!existingTour) {
+      return res.status(404).json({
+        success: false,
+        error: 'Tour not found',
+        message: 'No tour found with the provided ID'
+      });
+    }
+
+    // Allow editing draft, pending, and approved tours
+    // Edited tours keep their current status (approved tours stay approved)
+    if (existingTour.status !== 'draft' && existingTour.status !== 'pending' && existingTour.status !== 'approved') {
+      return res.status(400).json({
+        success: false,
+        error: 'Cannot edit tour',
+        message: 'Only draft, pending, and approved tours can be edited.'
+      });
+    }
+
+    // Prepare update data
+    const dataToUpdate = {};
+
+    // CRITICAL: Preserve existing status - don't change status when editing
+    // Only new tour submissions go to admin review, not edits
+    // This ensures pending tours stay pending, approved tours stay approved, etc.
+    dataToUpdate.status = existingTour.status;
+
+    if (updateData.title) dataToUpdate.title = updateData.title;
+    if (updateData.city) dataToUpdate.city = updateData.city;
+    if (updateData.category) dataToUpdate.category = updateData.category;
+    if (updateData.locations) dataToUpdate.locations = JSON.stringify(
+      typeof updateData.locations === 'string' ? JSON.parse(updateData.locations) : updateData.locations
+    );
+    if (updateData.duration) dataToUpdate.duration = updateData.duration;
+
+    // CRITICAL: If groupPricingTiers is provided, use first tier (1 person) price for pricePerPerson
+    // This ensures "Starting from" always shows the correct 1-person price
+    if (updateData.groupPricingTiers) {
+      try {
+        const tiers = typeof updateData.groupPricingTiers === 'string'
+          ? JSON.parse(updateData.groupPricingTiers)
+          : updateData.groupPricingTiers;
+        if (Array.isArray(tiers) && tiers.length > 0 && tiers[0] && tiers[0].price) {
+          const firstTierPrice = parseFloat(tiers[0].price);
+          if (!isNaN(firstTierPrice) && firstTierPrice > 0) {
+            dataToUpdate.pricePerPerson = firstTierPrice;
+            console.log(`✅ Updated pricePerPerson from groupPricingTiers[0]: ${firstTierPrice}`);
+          }
+        }
+      } catch (e) {
+        console.warn('⚠️ Failed to parse groupPricingTiers for pricePerPerson update:', e.message);
+        // Fallback to provided pricePerPerson if parsing fails
+        if (updateData.pricePerPerson !== undefined) {
+          dataToUpdate.pricePerPerson = parseFloat(updateData.pricePerPerson);
+        }
+      }
+    } else if (updateData.pricePerPerson !== undefined) {
+      // Only use provided pricePerPerson if groupPricingTiers is not provided
+      dataToUpdate.pricePerPerson = parseFloat(updateData.pricePerPerson);
+    }
+
+    if (updateData.currency) dataToUpdate.currency = updateData.currency;
+    if (updateData.shortDescription !== undefined) dataToUpdate.shortDescription = updateData.shortDescription;
+    if (updateData.fullDescription) dataToUpdate.fullDescription = updateData.fullDescription;
+    if (updateData.included) dataToUpdate.included = updateData.included;
+    if (updateData.notIncluded !== undefined) dataToUpdate.notIncluded = updateData.notIncluded;
+    if (updateData.meetingPoint !== undefined) dataToUpdate.meetingPoint = updateData.meetingPoint;
+    if (updateData.guideType !== undefined) dataToUpdate.guideType = updateData.guideType;
+    if (updateData.tourTypes !== undefined) {
+      dataToUpdate.tourTypes = updateData.tourTypes
+        ? JSON.stringify(typeof updateData.tourTypes === 'string' ? JSON.parse(updateData.tourTypes) : updateData.tourTypes)
+        : null;
+    }
+    if (updateData.images) dataToUpdate.images = JSON.stringify(
+      typeof updateData.images === 'string' ? JSON.parse(updateData.images) : updateData.images
+    );
+    if (updateData.languages) dataToUpdate.languages = JSON.stringify(
+      typeof updateData.languages === 'string' ? JSON.parse(updateData.languages) : updateData.languages
+    );
+
+    // Handle simplified pricing fields
+    if (updateData.maxGroupSize !== undefined) {
+      dataToUpdate.maxGroupSize = updateData.maxGroupSize ? parseInt(updateData.maxGroupSize) : null;
+    }
+    if (updateData.groupPrice !== undefined) {
+      dataToUpdate.groupPrice = updateData.groupPrice ? parseFloat(updateData.groupPrice) : null;
+    }
+    // Note: groupPricingTiers is stored on TourOption, not Tour model
+    // Main tour's groupPricingTiers will be stored in the main tour option (sortOrder: -1)
+    if (updateData.unavailableDates !== undefined) {
+      dataToUpdate.unavailableDates = updateData.unavailableDates
+        ? (typeof updateData.unavailableDates === 'string'
+          ? updateData.unavailableDates
+          : JSON.stringify(updateData.unavailableDates))
+        : null;
+    }
+    if (updateData.unavailableDaysOfWeek !== undefined) {
+      dataToUpdate.unavailableDaysOfWeek = updateData.unavailableDaysOfWeek
+        ? (typeof updateData.unavailableDaysOfWeek === 'string'
+          ? updateData.unavailableDaysOfWeek
+          : JSON.stringify(updateData.unavailableDaysOfWeek))
+        : null;
+    }
+
+    // CRITICAL: Save groupPricingTiers directly on Tour model (simple, reliable)
+    if (updateData.groupPricingTiers !== undefined) {
+      dataToUpdate.groupPricingTiers = updateData.groupPricingTiers
+        ? (typeof updateData.groupPricingTiers === 'string'
+          ? updateData.groupPricingTiers
+          : (Array.isArray(updateData.groupPricingTiers) && updateData.groupPricingTiers.length > 0
+            ? JSON.stringify(updateData.groupPricingTiers)
+            : null))
+        : null;
+      console.log('✅ Saving groupPricingTiers on Tour model:', {
+        hasValue: !!dataToUpdate.groupPricingTiers,
+        preview: dataToUpdate.groupPricingTiers ? dataToUpdate.groupPricingTiers.substring(0, 200) : 'null'
+      });
+    }
+
+    // Save new SEO and itinerary fields
+    if (updateData.itineraryItems !== undefined) {
+      dataToUpdate.itineraryItems = updateData.itineraryItems
+        ? (typeof updateData.itineraryItems === 'string' ? updateData.itineraryItems : JSON.stringify(updateData.itineraryItems))
+        : null;
+    }
+    if (updateData.detailedItinerary !== undefined) {
+      dataToUpdate.detailedItinerary = updateData.detailedItinerary || null;
+    }
+    if (updateData.pickupIncluded !== undefined) {
+      dataToUpdate.pickupIncluded = !!updateData.pickupIncluded;
+    }
+    if (updateData.visitorInfo !== undefined) {
+      dataToUpdate.visitorInfo = updateData.visitorInfo || null;
+    }
+    if (updateData.checklistItems !== undefined) {
+      dataToUpdate.checklistItems = updateData.checklistItems
+        ? (typeof updateData.checklistItems === 'string' ? updateData.checklistItems : JSON.stringify(updateData.checklistItems))
+        : null;
+    }
+    if (updateData.highlights !== undefined) {
+      dataToUpdate.highlights = updateData.highlights
+        ? (typeof updateData.highlights === 'string' ? updateData.highlights : JSON.stringify(updateData.highlights))
+        : null;
+    }
+
+    // Update tour first
+    const tourUpdateStartTime = Date.now();
+    const updatedTour = await prisma.tour.update({
+      where: { id: tourId },
+      data: dataToUpdate
+    });
+    console.log(`   ✅ Tour record updated (took ${Date.now() - tourUpdateStartTime}ms)`);
+
+    // CRITICAL: If main tour has groupPricingTiers, create main tour option BEFORE processing tourOptions
+    // This ensures "Starting from" always shows the correct 1-person price
+    if (updateData.groupPricingTiers) {
+      try {
+        const mainTourGroupPricingTiers = typeof updateData.groupPricingTiers === 'string'
+          ? JSON.parse(updateData.groupPricingTiers)
+          : updateData.groupPricingTiers;
+
+        if (Array.isArray(mainTourGroupPricingTiers) && mainTourGroupPricingTiers.length > 0 && mainTourGroupPricingTiers[0]?.price) {
+          const firstTierPrice = parseFloat(mainTourGroupPricingTiers[0].price);
+          if (!isNaN(firstTierPrice) && firstTierPrice > 0) {
+            const mainTourOption = {
+              optionTitle: updateData.title || existingTour.title,
+              optionDescription: updateData.shortDescription || existingTour.shortDescription || existingTour.fullDescription?.substring(0, 200) || 'Main tour option',
+              durationHours: (() => {
+                const durStr = (updateData.duration || existingTour.duration || '').toLowerCase();
+                const num = parseFloat(durStr.replace(/[^0-9.]/g, '')) || 3;
+                return durStr.includes('day') ? num * 24 : num;
+              })(),
+              price: firstTierPrice, // ALWAYS use first tier (1 person) price
+              currency: updateData.currency || existingTour.currency || 'INR',
+              language: (updateData.languages ? (typeof updateData.languages === 'string' ? JSON.parse(updateData.languages) : updateData.languages) : JSON.parse(existingTour.languages || '["English"]'))?.[0] || 'English',
+              pickupIncluded: false,
+              entryTicketIncluded: false,
+              guideIncluded: true,
+              carIncluded: false,
+              groupPricingTiers: typeof mainTourGroupPricingTiers === 'string' ? mainTourGroupPricingTiers : JSON.stringify(mainTourGroupPricingTiers),
+              sortOrder: -1 // Main tour option comes first
+            };
+
+            // Ensure tourOptions is an array and prepend main tour option
+            if (!updateData.tourOptions || !Array.isArray(updateData.tourOptions)) {
+              updateData.tourOptions = [];
+            }
+            // Remove any existing main tour option (sortOrder: -1) to avoid duplicates
+            updateData.tourOptions = updateData.tourOptions.filter((opt) => opt.sortOrder !== -1);
+            // Prepend main tour option
+            updateData.tourOptions = [mainTourOption, ...updateData.tourOptions];
+
+            console.log('✅ Created main tour option from groupPricingTiers:', {
+              firstTierPrice,
+              tiersCount: mainTourGroupPricingTiers.length,
+              totalOptions: updateData.tourOptions.length
+            });
+          }
+        }
+      } catch (e) {
+        console.warn('⚠️ Failed to parse main tour groupPricingTiers for update:', e.message);
+      }
+    }
+
+    // Handle tour options update (delete old ones and create new ones)
+    if (updateData.tourOptions !== undefined && Array.isArray(updateData.tourOptions)) {
+      try {
+        const optionsStartTime = Date.now();
+        console.log(`📋 Updating tour options for tour ${tourId}, count: ${updateData.tourOptions.length}`);
+
+        // Delete all existing options for this tour
+        const deleteStartTime = Date.now();
+        await prisma.tourOption.deleteMany({
+          where: { tourId: tourId }
+        });
+        console.log(`   ✅ Deleted existing options (took ${Date.now() - deleteStartTime}ms)`);
+
+        // Create new options
+        if (updateData.tourOptions.length > 0) {
+          const VALID_TOUR_OPTION_FIELDS = [
+            'optionTitle', 'optionDescription', 'durationHours', 'price', 'currency',
+            'language', 'pickupIncluded', 'entryTicketIncluded', 'guideIncluded',
+            'carIncluded', 'groupPricingTiers', 'sortOrder'
+          ];
+
+          const optionsToCreate = updateData.tourOptions.map((opt, index) => {
+            const cleanOpt = {};
+            VALID_TOUR_OPTION_FIELDS.forEach(field => {
+              // CRITICAL: For groupPricingTiers, check if it exists (even if empty string)
+              // Empty string is valid - it means "no custom pricing, use main tour pricing"
+              if (field === 'groupPricingTiers') {
+                if (opt[field] !== undefined && opt[field] !== null) {
+                  if (typeof opt[field] === 'string') {
+                    cleanOpt[field] = opt[field]; // Already stringified
+                  } else if (Array.isArray(opt[field])) {
+                    cleanOpt[field] = JSON.stringify(opt[field]);
+                  } else {
+                    cleanOpt[field] = JSON.stringify(opt[field]);
+                  }
+                  console.log(`✅ Option ${index + 1} groupPricingTiers included in cleanOpt`);
+                } else {
+                  console.log(`ℹ️ Option ${index + 1} has no groupPricingTiers (will use main tour pricing)`);
+                }
+              } else if (field in opt && opt[field] !== undefined && opt[field] !== null) {
+                cleanOpt[field] = opt[field];
+              }
+            });
+
+            // CRITICAL: Ensure option price uses first tier (1 person) price from groupPricingTiers
+            if (opt.groupPricingTiers) {
+              try {
+                const tiers = typeof opt.groupPricingTiers === 'string'
+                  ? JSON.parse(opt.groupPricingTiers)
+                  : opt.groupPricingTiers;
+                if (Array.isArray(tiers) && tiers.length > 0 && tiers[0] && tiers[0].price) {
+                  const firstTierPrice = parseFloat(tiers[0].price);
+                  if (!isNaN(firstTierPrice) && firstTierPrice > 0) {
+                    cleanOpt.price = firstTierPrice; // Override with first tier price
+                    console.log(`✅ Option ${index + 1} price set from first tier: ${firstTierPrice}`);
+                  }
+                }
+              } catch (e) {
+                console.warn(`⚠️ Failed to parse groupPricingTiers for option ${index + 1}:`, e.message);
+              }
+            }
+
+            // Remove any ID fields and invalid fields
+            delete cleanOpt.id;
+            delete cleanOpt.tourId;
+            delete cleanOpt.pricingType;
+            delete cleanOpt.pricing_type;
+            delete cleanOpt.maxGroupSize;
+            delete cleanOpt.max_group_size;
+            delete cleanOpt.groupPrice;
+            delete cleanOpt.group_price;
+            return cleanOpt;
+          });
+
+          // Strip legacy ghost options: sortOrder 0 whose title matches the tour title
+          // These are system-generated options from old code that should never appear as user options
+          const currentTourTitle = ((updateData.title || existingTour.title) || '').toLowerCase().trim();
+          const oldTourTitle = (existingTour.title || '').toLowerCase().trim();
+          const finalOptionsToCreate = optionsToCreate.filter(opt => {
+            if (opt.sortOrder === 0) {
+              const optTitle = (opt.optionTitle || '').toLowerCase().trim();
+              if (optTitle === currentTourTitle || optTitle === oldTourTitle) {
+                console.log(`🧹 Stripped legacy ghost option at sortOrder 0: "${opt.optionTitle}"`);
+                return false;
+              }
+            }
+            return true;
+          });
+
+          // CRITICAL: Log options before saving
+          console.log(`📤 About to create ${finalOptionsToCreate.length} options:`);
+          finalOptionsToCreate.forEach((opt, idx) => {
+            console.log(`   Option ${idx + 1} (${opt.optionTitle}):`, {
+              hasGroupPricingTiers: !!opt.groupPricingTiers,
+              groupPricingTiersType: typeof opt.groupPricingTiers,
+              preview: opt.groupPricingTiers ? opt.groupPricingTiers.substring(0, 100) : 'null'
+            });
+          });
+
+          // Use createMany for better performance (batch insert)
+          const createStartTime = Date.now();
+          await prisma.tourOption.createMany({
+            data: finalOptionsToCreate.map(opt => ({
+              ...opt,
+              tourId: tourId
+            }))
+          });
+          console.log(`   ✅ Created ${optionsToCreate.length} options (took ${Date.now() - createStartTime}ms)`);
+
+          // CRITICAL: Verify what was actually saved
+          const savedOptions = await prisma.tourOption.findMany({
+            where: { tourId: tourId },
+            select: { id: true, optionTitle: true, groupPricingTiers: true }
+          });
+          console.log(`   🔍 Verification - Saved options:`);
+          savedOptions.forEach((opt, idx) => {
+            console.log(`      Option ${idx + 1} (${opt.optionTitle}):`, {
+              hasGroupPricingTiers: !!opt.groupPricingTiers,
+              verification: opt.groupPricingTiers ? '✅ SAVED' : '❌ MISSING'
+            });
+          });
+          console.log(`   ✅ Total options update time: ${Date.now() - optionsStartTime}ms`);
+        }
+      } catch (optionsError) {
+        console.error('⚠️ Error updating tour options:', optionsError);
+        console.error('   Error details:', optionsError.message);
+        console.error('   Error stack:', optionsError.stack);
+        // Don't fail the whole request if options update fails - log but continue
+      }
+    }
+
+    // Fetch updated tour with options
+    const tourWithOptions = await prisma.tour.findUnique({
+      where: { id: tourId },
+      include: {
+        options: {
+          orderBy: {
+            sortOrder: 'asc'
+          }
+        }
+      }
+    });
+
+    // Parse JSON fields
+    const formattedTour = {
+      ...tourWithOptions,
+      id: String(tourWithOptions.id),
+      locations: JSON.parse(tourWithOptions.locations || '[]'),
+      images: JSON.parse(tourWithOptions.images || '[]'),
+      languages: JSON.parse(tourWithOptions.languages || '[]'),
+      highlights: tourWithOptions.highlights ? JSON.parse(tourWithOptions.highlights || '[]') : [],
+      tourTypes: tourWithOptions.tourTypes ? JSON.parse(tourWithOptions.tourTypes || '[]') : [],
+      options: tourWithOptions.options || []
+    };
+
+    const totalUpdateTime = Date.now() - updateStartTime;
+    console.log(`✅ Tour updated successfully: ${tourId} (took ${totalUpdateTime}ms)`);
+
+    // Clear tours cache so edits show up immediately
+    toursCache.clear();
+
+    res.json({
+      success: true,
+      message: 'Tour updated successfully',
+      tour: formattedTour
+    });
+  } catch (error) {
+    console.error('Tour update error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to update tour'
+    });
+  }
+});
+
+// Delete tour (only if draft)
+app.delete('/api/tours/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const tourId = parseInt(id);
+
+    if (isNaN(tourId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid tour ID',
+        message: 'Tour ID must be a valid number'
+      });
+    }
+
+    // Check if tour exists and is in draft status
+    const existingTour = await prisma.tour.findUnique({
+      where: { id: tourId }
+    });
+
+    if (!existingTour) {
+      return res.status(404).json({
+        success: false,
+        error: 'Tour not found',
+        message: 'No tour found with the provided ID'
+      });
+    }
+
+    if (existingTour.status !== 'draft') {
+      return res.status(400).json({
+        success: false,
+        error: 'Cannot delete tour',
+        message: 'Only draft tours can be deleted'
+      });
+    }
+
+    await prisma.tour.delete({
+      where: { id: tourId }
+    });
+
+    console.log('✅ Tour deleted successfully:', tourId);
+
+    res.json({
+      success: true,
+      message: 'Tour deleted successfully'
+    });
+  } catch (error) {
+    console.error('Tour delete error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to delete tour'
+    });
+  }
+});
+
+// ==================== ADMIN AUTHENTICATION MIDDLEWARE ====================
+
+// Middleware to verify admin authentication (simple check via header)
+const verifyAdmin = (req, res, next) => {
+  // In a real app, you'd verify JWT token here
+  // For now, we'll check if admin session exists (frontend will send a header)
+  const adminHeader = req.headers['x-admin-auth'];
+
+  if (adminHeader === 'authenticated') {
+    next();
+  } else {
+    res.status(401).json({
+      success: false,
+      error: 'Unauthorized',
+      message: 'Admin authentication required'
+    });
+  }
+};
+
+// Delete tour (admin - can delete any status)
+app.delete('/api/admin/tours/:id', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const tourId = parseInt(id);
+
+    if (isNaN(tourId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid tour ID',
+        message: 'Tour ID must be a valid number'
+      });
+    }
+
+    const existingTour = await prisma.tour.findUnique({
+      where: { id: tourId }
+    });
+
+    if (!existingTour) {
+      return res.status(404).json({
+        success: false,
+        error: 'Tour not found',
+        message: 'No tour found with the provided ID'
+      });
+    }
+
+    await prisma.tour.delete({
+      where: { id: tourId }
+    });
+
+    console.log('✅ Tour deleted successfully (admin):', tourId);
+
+    res.json({
+      success: true,
+      message: 'Tour deleted successfully'
+    });
+  } catch (error) {
+    console.error('Tour delete error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to delete tour'
+    });
+  }
+});
+
+// ==================== ADMIN AUTHENTICATION ====================
+
+// Admin credentials (in production, use environment variables)
+const ADMIN_CREDENTIALS = {
+  username: (process.env.ADMIN_USERNAME || 'admin').trim(),
+  password: (process.env.ADMIN_PASSWORD || 'admin123').trim() // Change this in production!
+};
+
+// Log admin credentials status (without exposing password)
+console.log('🔐 Admin credentials loaded:', {
+  username: ADMIN_CREDENTIALS.username,
+  passwordSet: !!process.env.ADMIN_PASSWORD,
+  passwordLength: ADMIN_CREDENTIALS.password.length
+});
+
+// Rate limiting disabled - no IP locking
+const rateLimitAdminLogin = (req, res, next) => {
+  next(); // No rate limiting
+};
+
+// Admin login endpoint
+app.post('/api/admin/login', rateLimitAdminLogin, async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const clientIp = req.ip || req.connection.remoteAddress || 'unknown';
+
+    if (!username || !password) {
+      return res.status(400).json({
+        error: 'Username and password are required'
+      });
+    }
+
+    // Normalize inputs (trim whitespace)
+    const normalizedUsername = username.trim();
+    const normalizedPassword = password.trim();
+
+    // Debug logging (don't log actual password, just length)
+    console.log('🔐 Admin login attempt:');
+    console.log('   Username received:', normalizedUsername);
+    console.log('   Password length:', normalizedPassword.length);
+    console.log('   Expected username:', ADMIN_CREDENTIALS.username);
+    console.log('   Expected password length:', ADMIN_CREDENTIALS.password.length);
+    console.log('   Username match:', normalizedUsername === ADMIN_CREDENTIALS.username);
+    console.log('   Password match:', normalizedPassword === ADMIN_CREDENTIALS.password);
+
+    // Simple authentication (in production, use JWT tokens and bcrypt)
+    if (normalizedUsername === ADMIN_CREDENTIALS.username && normalizedPassword === ADMIN_CREDENTIALS.password) {
+      console.log('✅ Admin login successful:', username, 'from IP:', clientIp);
+      res.json({
+        success: true,
+        username: username,
+        message: 'Login successful'
+      });
+    } else {
+      console.log('❌ Admin login failed:', username, 'from IP:', clientIp);
+      console.log('   Reason: Username or password mismatch');
+      res.status(401).json({
+        error: 'Invalid credentials',
+        message: 'Username or password is incorrect'
+      });
+    }
+  } catch (error) {
+    console.error('Admin login error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Failed to process login request'
+    });
+  }
+});
+
+// ==================== ADMIN TOUR REVIEW ENDPOINTS ====================
+
+// Approve tour (admin)
+app.post('/api/admin/tours/:id/approve', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const tourId = parseInt(id);
+    // Bulk imports approve hundreds of tours back to back. Each approval used to rebuild the whole
+    // sitemap, ping Google's Indexing API and email the supplier; that took the API down (502s) on the
+    // small Render instance. ?bulk=1 (or x-bulk-import: 1) keeps the approval and the cache clear only.
+    const bulk = req.query.bulk === '1' || req.get('x-bulk-import') === '1';
+
+    if (isNaN(tourId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid tour ID'
+      });
+    }
+
+    const tour = await prisma.tour.findUnique({
+      where: { id: tourId }
+    });
+
+    if (!tour) {
+      return res.status(404).json({
+        success: false,
+        error: 'Tour not found'
+      });
+    }
+
+    // Allow approving tours that are 'pending' or 'draft'
+    if (tour.status !== 'pending' && tour.status !== 'draft') {
+      return res.status(400).json({
+        success: false,
+        error: 'Tour cannot be approved',
+        message: `Tour status is: ${tour.status}. Only pending or draft tours can be approved.`
+      });
+    }
+
+    const updatedTour = await prisma.tour.update({
+      where: { id: tourId },
+      data: {
+        status: 'approved',
+        approvedAt: new Date()
+      },
+      include: {
+        supplier: {
+          select: {
+            id: true,
+            fullName: true,
+            email: true
+          }
+        }
+      }
+    });
+
+    // Clear tours cache so the new approved tour shows up immediately
+    toursCache.clear();
+    console.log('🗑️  Tours cache cleared after tour approval');
+
+    if (!bulk) {
+    // Regenerate sitemap after tour approval (non-blocking)
+    // This ensures new tours are automatically added to sitemap for Google indexing
+    const tourUrl = `https://www.globewithlocals.com/${updatedTour.country.toLowerCase()}/${updatedTour.city.toLowerCase()}/${updatedTour.slug}`;
+    generateSitemap().then(() => {
+      console.log('✅ Sitemap successfully regenerated - new tour will be indexed by Google');
+      console.log(`   Tour URL: ${tourUrl}`);
+      console.log(`   Sitemap URL: https://www.globewithlocals.com/sitemap.xml`);
+
+      // Ping Google Indexing API immediately after sitemap is updated (non-blocking)
+      notifyGoogleIndexing(tourUrl).then(() => {
+        console.log('✅ Google Indexing API notification sent - tour will be crawled within minutes');
+      }).catch(indexErr => {
+        console.error('⚠️ Google Indexing API notification failed (non-critical):', indexErr.message);
+      });
+    }).catch(sitemapError => {
+      console.error('⚠️ Sitemap regeneration failed (non-critical):', sitemapError.message);
+      console.error('   This tour will still be approved, but sitemap needs manual update');
+    });
+
+    // Send approval email to supplier using Resend (non-blocking)
+    try {
+      const supplierEmail = updatedTour.supplier.email;
+      const supplierName = updatedTour.supplier.fullName || 'Supplier';
+      const tourTitle = updatedTour.title;
+      const tourSlug = updatedTour.slug;
+      const city = updatedTour.city;
+      const country = updatedTour.country;
+
+      if (supplierEmail && supplierEmail.includes('@')) {
+        console.log(`📧 Tour approved - Sending approval email to supplier via Resend:`);
+        console.log(`   Supplier: ${supplierName}`);
+        console.log(`   Email: ${supplierEmail}`);
+        console.log(`   Tour: ${tourTitle}`);
+        console.log(`   Location: ${city}, ${country}`);
+
+        // Send email using Resend (will use Resend SDK if RESEND_API_KEY is configured)
+        sendTourApprovalEmail(
+          supplierEmail,
+          supplierName,
+          tourTitle,
+          tourSlug,
+          city,
+          country
+        ).then(result => {
+          console.log(`✅ Tour approval email sent successfully via Resend`);
+          console.log(`   Message ID: ${result.messageId}`);
+        }).catch(err => {
+          console.error('⚠️ Failed to send tour approval email (non-critical):', err.message);
+          console.error('   Error details:', err);
+        });
+      } else {
+        console.warn(`⚠️ Invalid supplier email, skipping approval email: ${supplierEmail}`);
+      }
+    } catch (emailError) {
+      console.error('⚠️ Tour approval email setup failed (non-critical):', emailError.message);
+    }
+    }
+
+    // Parse JSON fields
+    const formattedTour = {
+      ...updatedTour,
+      id: String(updatedTour.id),
+      locations: JSON.parse(updatedTour.locations || '[]'),
+      images: JSON.parse(updatedTour.images || '[]'),
+      languages: JSON.parse(updatedTour.languages || '[]'),
+      highlights: updatedTour.highlights ? JSON.parse(updatedTour.highlights || '[]') : []
+    };
+
+    console.log(`✅ Tour ${tourId} approved by admin`);
+
+    res.json({
+      success: true,
+      message: 'Tour approved successfully',
+      tour: formattedTour
+    });
+  } catch (error) {
+    console.error('Tour approval error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to approve tour'
+    });
+  }
+});
+
+// Reject tour (admin)
+app.post('/api/admin/tours/:id/reject', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rejectionReason } = req.body;
+    const tourId = parseInt(id);
+
+    if (isNaN(tourId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid tour ID'
+      });
+    }
+
+    if (!rejectionReason || rejectionReason.trim() === '') {
+      return res.status(400).json({
+        success: false,
+        error: 'Rejection reason is required'
+      });
+    }
+
+    const tour = await prisma.tour.findUnique({
+      where: { id: tourId }
+    });
+
+    if (!tour) {
+      return res.status(404).json({
+        success: false,
+        error: 'Tour not found'
+      });
+    }
+
+    if (tour.status !== 'pending') {
+      return res.status(400).json({
+        success: false,
+        error: 'Tour is not pending review',
+        message: `Tour status is: ${tour.status}. Only pending tours can be rejected.`
+      });
+    }
+
+    const updatedTour = await prisma.tour.update({
+      where: { id: tourId },
+      data: {
+        status: 'rejected',
+        rejectionReason: rejectionReason.trim()
+      },
+      include: {
+        supplier: {
+          select: {
+            id: true,
+            fullName: true,
+            email: true
+          }
+        }
+      }
+    });
+
+    // Send rejection email to supplier using Resend (non-blocking)
+    try {
+      const supplierEmail = updatedTour.supplier.email;
+      const supplierName = updatedTour.supplier.fullName || 'Supplier';
+      const tourTitle = updatedTour.title;
+      const city = updatedTour.city;
+      const country = updatedTour.country;
+
+      if (supplierEmail && supplierEmail.includes('@')) {
+        console.log(`📧 Tour rejected - Sending rejection email to supplier via Resend:`);
+        console.log(`   Supplier: ${supplierName}`);
+        console.log(`   Email: ${supplierEmail}`);
+        console.log(`   Tour: ${tourTitle}`);
+        console.log(`   Location: ${city}, ${country}`);
+        console.log(`   Rejection Reason: ${rejectionReason.trim()}`);
+
+        // Send email using Resend (will use Resend SDK if RESEND_API_KEY is configured)
+        sendTourRejectionEmail(
+          supplierEmail,
+          supplierName,
+          tourTitle,
+          rejectionReason.trim(),
+          city,
+          country
+        ).then(result => {
+          console.log(`✅ Tour rejection email sent successfully via Resend`);
+          console.log(`   Message ID: ${result.messageId}`);
+        }).catch(err => {
+          console.error('⚠️ Failed to send tour rejection email (non-critical):', err.message);
+          console.error('   Error details:', err);
+        });
+      } else {
+        console.warn(`⚠️ Invalid supplier email, skipping rejection email: ${supplierEmail}`);
+      }
+    } catch (emailError) {
+      console.error('⚠️ Tour rejection email setup failed (non-critical):', emailError.message);
+    }
+
+    // Parse JSON fields
+    const formattedTour = {
+      ...updatedTour,
+      id: String(updatedTour.id),
+      locations: JSON.parse(updatedTour.locations || '[]'),
+      images: JSON.parse(updatedTour.images || '[]'),
+      languages: JSON.parse(updatedTour.languages || '[]'),
+      highlights: updatedTour.highlights ? JSON.parse(updatedTour.highlights || '[]') : []
+    };
+
+    console.log(`❌ Tour ${tourId} rejected by admin`);
+
+    res.json({
+      success: true,
+      message: 'Tour rejected successfully',
+      tour: formattedTour
+    });
+  } catch (error) {
+    console.error('Tour rejection error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to reject tour'
+    });
+  }
+});
+
+// Get all tours (admin) - can filter by status
+// NOTE: Drafts are NEVER shown to admins - only suppliers can see their own drafts
+app.get('/api/admin/tours', verifyAdmin, async (req, res) => {
+  try {
+    const { status } = req.query;
+    const where = {};
+
+    // If filtering by specific status (and it's not 'all'), use that status
+    // But NEVER allow 'draft' status - admins should never see drafts
+    if (status && status !== 'all' && status !== 'draft') {
+      where.status = status;
+    } else {
+      // For 'all' or no status specified, show all tours EXCEPT drafts
+      where.status = { not: 'draft' };
+    }
+
+    console.log('📋 Fetching tours for admin dashboard');
+    console.log('   Filter status:', status || 'all');
+    console.log('   Where clause:', JSON.stringify(where));
+    console.log('   ⚠️ Drafts are excluded - only suppliers can see their own drafts');
+
+    let tours;
+    try {
+      console.log('   🔍 Executing Prisma query...');
+      tours = await prisma.tour.findMany({
+        where,
+        include: {
+          supplier: {
+            select: {
+              id: true,
+              fullName: true,
+              companyName: true,
+              email: true,
+              phone: true,
+              whatsapp: true,
+              emailVerified: true,
+              verificationDocumentUrl: true
+            }
+          }
+        },
+        orderBy: {
+          createdAt: 'desc'
+        }
+      });
+    } catch (dbError) {
+      console.error('❌ Database error fetching tours:', dbError);
+      // If error is about missing column, try without tourTypes
+      if (dbError.message?.includes('tour_types') || dbError.message?.includes('tourTypes')) {
+        console.log('⚠️  tourTypes column might not exist, trying query without it...');
+        // The query should still work - Prisma handles missing columns gracefully
+        // But let's log the error and return empty array
+        return res.json({
+          success: true,
+          tours: [],
+          count: 0,
+          error: 'Database schema mismatch - please run migrations'
+        });
+      }
+      throw dbError;
+    }
+
+    console.log(`   ✅ Query successful - found ${tours?.length || 0} tours`);
+    if (tours && tours.length > 0) {
+      console.log(`   📊 Sample tour IDs:`, tours.slice(0, 5).map(t => t.id));
+      console.log(`   📊 Sample tour statuses:`, tours.slice(0, 5).map(t => t.status));
+    } else {
+      console.log(`   ⚠️  No tours found with filter:`, JSON.stringify(where));
+    }
+
+    // Parse JSON fields with safe error handling
+    const formattedTours = tours.map(tour => {
+      try {
+        // Safely parse tourTypes - handle if column doesn't exist
+        let tourTypes = [];
+        if (tour.tourTypes !== undefined && tour.tourTypes !== null) {
+          if (typeof tour.tourTypes === 'string') {
+            try {
+              tourTypes = JSON.parse(tour.tourTypes);
+            } catch (e) {
+              console.warn(`Failed to parse tourTypes for tour ${tour.id}:`, e.message);
+              tourTypes = [];
+            }
+          } else if (Array.isArray(tour.tourTypes)) {
+            tourTypes = tour.tourTypes;
+          }
+        }
+
+        return {
+          ...tour,
+          id: String(tour.id),
+          locations: JSON.parse(tour.locations || '[]'),
+          images: JSON.parse(tour.images || '[]'),
+          languages: JSON.parse(tour.languages || '[]'),
+          highlights: tour.highlights ? JSON.parse(tour.highlights || '[]') : [],
+          tourTypes: tourTypes,
+          supplier: {
+            ...tour.supplier,
+            id: String(tour.supplier.id)
+          }
+        };
+      } catch (parseError) {
+        console.error(`Error formatting tour ${tour.id}:`, parseError);
+        console.error(`   Parse error details:`, parseError.message);
+        // Return tour with safe defaults - still return it so admin can see it
+        return {
+          ...tour,
+          id: String(tour.id),
+          locations: [],
+          images: [],
+          languages: ['English'],
+          highlights: [],
+          tourTypes: [],
+          supplier: tour.supplier ? {
+            ...tour.supplier,
+            id: String(tour.supplier.id)
+          } : null
+        };
+      }
+    });
+
+    res.json({
+      success: true,
+      tours: formattedTours,
+      count: formattedTours.length
+    });
+  } catch (error) {
+    console.error('Get admin tours error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to fetch tours'
+    });
+  }
+});
+
+// Regenerate sitemap (admin endpoint)
+app.post('/api/admin/sitemap/regenerate', verifyAdmin, async (req, res) => {
+  try {
+    console.log('🔄 Admin requested sitemap regeneration');
+    const { exec } = await import('child_process');
+    const { promisify } = await import('util');
+    const execAsync = promisify(exec);
+
+    // Run sitemap generation script (path relative to this file's directory,
+    // since process.cwd() here is already server/, not the repo root)
+    const { stdout, stderr } = await execAsync('node generate-sitemap.js', { cwd: __dirname });
+
+    console.log('✅ Sitemap regenerated successfully');
+    console.log('   Output:', stdout);
+    if (stderr) {
+      console.warn('   Warnings:', stderr);
+    }
+
+    res.json({
+      success: true,
+      message: 'Sitemap regenerated successfully',
+      output: stdout
+    });
+  } catch (error) {
+    console.error('❌ Sitemap regeneration failed:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to regenerate sitemap',
+      message: error.message
+    });
+  }
+});
+
+// Get all pending tours (admin) - for backward compatibility
+app.get('/api/admin/tours/pending', verifyAdmin, async (req, res) => {
+  try {
+    console.log('📋 Fetching PENDING tours for admin dashboard');
+    // Get only pending tours (submitted for review) - drafts are not visible to admins
+    let tours;
+    try {
+      tours = await prisma.tour.findMany({
+        where: {
+          status: 'pending'
+        },
+        include: {
+          supplier: {
+            select: {
+              id: true,
+              fullName: true,
+              companyName: true,
+              email: true,
+              phone: true,
+              whatsapp: true,
+              emailVerified: true,
+              verificationDocumentUrl: true
+            }
+          }
+        },
+        orderBy: {
+          createdAt: 'desc'
+        }
+      });
+    } catch (dbError) {
+      console.error('❌ Database error fetching pending tours:', dbError);
+      if (dbError.message?.includes('tour_types') || dbError.message?.includes('tourTypes')) {
+        console.log('⚠️  tourTypes column might not exist, returning empty array');
+        return res.json({
+          success: true,
+          tours: [],
+          count: 0,
+          error: 'Database schema mismatch - please run migrations'
+        });
+      }
+      throw dbError;
+    }
+
+    console.log(`   Found ${tours.length} tours`);
+    if (tours.length > 0) {
+      const statusBreakdown = tours.reduce((acc, t) => {
+        acc[t.status] = (acc[t.status] || 0) + 1;
+        return acc;
+      }, {});
+      console.log(`   Status breakdown:`, statusBreakdown);
+    }
+
+    // Parse JSON fields with safe error handling
+    const formattedTours = tours.map(tour => {
+      try {
+        // Safely parse tourTypes - handle if column doesn't exist
+        let tourTypes = [];
+        if (tour.tourTypes !== undefined && tour.tourTypes !== null) {
+          if (typeof tour.tourTypes === 'string') {
+            try {
+              tourTypes = JSON.parse(tour.tourTypes);
+            } catch (e) {
+              console.warn(`Failed to parse tourTypes for tour ${tour.id}:`, e.message);
+              tourTypes = [];
+            }
+          } else if (Array.isArray(tour.tourTypes)) {
+            tourTypes = tour.tourTypes;
+          }
+        }
+
+        return {
+          ...tour,
+          id: String(tour.id),
+          locations: JSON.parse(tour.locations || '[]'),
+          images: JSON.parse(tour.images || '[]'),
+          languages: JSON.parse(tour.languages || '[]'),
+          highlights: tour.highlights ? JSON.parse(tour.highlights || '[]') : [],
+          tourTypes: tourTypes,
+          supplier: {
+            ...tour.supplier,
+            id: String(tour.supplier.id)
+          }
+        };
+      } catch (parseError) {
+        console.error(`Error formatting tour ${tour.id}:`, parseError);
+        console.error(`   Parse error details:`, parseError.message);
+        // Return tour with safe defaults - still return it so admin can see it
+        return {
+          ...tour,
+          id: String(tour.id),
+          locations: [],
+          images: [],
+          languages: ['English'],
+          highlights: [],
+          tourTypes: [],
+          supplier: tour.supplier ? {
+            ...tour.supplier,
+            id: String(tour.supplier.id)
+          } : null
+        };
+      }
+    });
+
+    res.json({
+      success: true,
+      tours: formattedTours,
+      count: formattedTours.length
+    });
+  } catch (error) {
+    console.error('Get pending tours error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to fetch pending tours'
+    });
+  }
+});
+
+// ==================== ADMIN SUPPLIER ENDPOINTS ====================
+
+// Get all pending suppliers (admin)
+app.get('/api/admin/suppliers/pending', verifyAdmin, async (req, res) => {
+  try {
+    console.log('📋 Fetching suppliers for admin dashboard');
+
+    // Retry logic for Render free tier database connection issues
+    let suppliers = null;
+    let findAttempts = 0;
+    const MAX_FIND_RETRIES = 3;
+
+    while (findAttempts < MAX_FIND_RETRIES && !suppliers) {
+      try {
+        // Get only pending suppliers (exclude rejected and approved)
+        suppliers = await prisma.supplier.findMany({
+          where: {
+            status: 'pending'
+          },
+          orderBy: {
+            createdAt: 'desc'
+          },
+          select: {
+            id: true,
+            email: true,
+            fullName: true,
+            businessType: true,
+            status: true,
+            emailVerified: true,
+            createdAt: true,
+            companyName: true,
+            mainHub: true,
+            city: true,
+            phone: true,
+            whatsapp: true,
+            verificationDocumentUrl: true,
+            certificates: true
+          }
+        });
+        break; // Success, exit retry loop
+      } catch (dbError) {
+        findAttempts++;
+        console.error(`   Database error fetching suppliers (attempt ${findAttempts}/${MAX_FIND_RETRIES}):`, dbError.message);
+
+        // If it's a connection error and we have retries left, wait and retry
+        if (findAttempts < MAX_FIND_RETRIES && (
+          dbError.message?.includes('connection') ||
+          dbError.message?.includes('timeout') ||
+          dbError.code === 'P1001' ||
+          dbError.code === 'P1017' ||
+          dbError.code === 'P1008'
+        )) {
+          console.log(`   Retrying in ${findAttempts * 500}ms...`);
+          await new Promise(resolve => setTimeout(resolve, findAttempts * 500));
+          continue;
+        }
+        // Not a retryable error, throw
+        throw dbError;
+      }
+    }
+
+    if (!suppliers) {
+      throw new Error('Failed to fetch suppliers after retries');
+    }
+
+    console.log(`   ✅ Found ${suppliers.length} suppliers`);
+    if (suppliers.length > 0) {
+      const statusBreakdown = suppliers.reduce((acc, s) => {
+        acc[s.status] = (acc[s.status] || 0) + 1;
+        return acc;
+      }, {});
+      console.log(`   Status breakdown:`, statusBreakdown);
+    }
+
+    // Format suppliers
+    const formattedSuppliers = suppliers.map(supplier => ({
+      ...supplier,
+      id: String(supplier.id)
+    }));
+
+    res.json({
+      success: true,
+      suppliers: formattedSuppliers,
+      count: formattedSuppliers.length
+    });
+  } catch (error) {
+    console.error('❌ Get pending suppliers error:', error);
+    console.error('   Error message:', error.message);
+    console.error('   Error code:', error.code);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to fetch pending suppliers. Please try again.',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Get all suppliers with payment details (admin) - OPTIMIZED for bulk operations
+app.get('/api/admin/suppliers/payment-details', verifyAdmin, async (req, res) => {
+  try {
+    console.log('📋 Fetching suppliers with payment details for admin (optimized)');
+
+    // Fetch all suppliers with payment/tax details
+    const suppliers = await prisma.supplier.findMany({
+      select: {
+        id: true,
+        email: true,
+        fullName: true,
+        companyName: true,
+        businessType: true,
+        status: true,
+        createdAt: true,
+        paymentMethod: true,
+        paymentMethodDetails: true,
+        paymentCurrency: true,
+        paymentFrequency: true,
+        taxId: true,
+        taxIdType: true,
+        taxCountry: true,
+        taxVerified: true,
+        paymentDetailsVerified: true,
+        paymentDetailsVerifiedAt: true
+      },
+      orderBy: {
+        createdAt: 'desc'
+      }
+    });
+
+    // Fetch all bookings in a single optimized query (instead of N+1 queries)
+    const supplierIds = suppliers.map(s => parseInt(s.id));
+    const allBookings = await prisma.booking.findMany({
+      where: {
+        supplierId: { in: supplierIds }
+      },
+      select: {
+        id: true,
+        supplierId: true,
+        totalAmount: true,
+        paymentStatus: true,
+        createdAt: true
+      }
+    });
+
+    // Group bookings by supplier ID for fast lookup
+    const bookingsBySupplier = {};
+    allBookings.forEach(booking => {
+      const supplierId = String(booking.supplierId);
+      if (!bookingsBySupplier[supplierId]) {
+        bookingsBySupplier[supplierId] = [];
+      }
+      bookingsBySupplier[supplierId].push(booking);
+    });
+
+    // Commission rate: 70% to supplier, 30% platform
+    const supplierRate = 0.70;
+
+    // Process suppliers with earnings calculation
+    const suppliersWithEarnings = suppliers.map(supplier => {
+      const supplierId = String(supplier.id);
+      const bookings = bookingsBySupplier[supplierId] || [];
+
+      const paidBookings = bookings.filter(b => b.paymentStatus === 'paid');
+      const pendingBookings = bookings.filter(b => b.paymentStatus === 'pending');
+
+      const grossEarnings = paidBookings.reduce((sum, b) => sum + (parseFloat(b.totalAmount) * supplierRate), 0);
+      const pendingEarnings = pendingBookings.reduce((sum, b) => sum + (parseFloat(b.totalAmount) * supplierRate), 0);
+
+      // Calculate TDS
+      const tdsDeducted = calculateTDS(grossEarnings, supplier.taxCountry, supplier.taxVerified || false);
+      const netEarnings = grossEarnings - tdsDeducted;
+
+      // Parse paymentMethodDetails if it's a string
+      let paymentDetails = null;
+      if (supplier.paymentMethodDetails) {
+        try {
+          paymentDetails = typeof supplier.paymentMethodDetails === 'string'
+            ? JSON.parse(supplier.paymentMethodDetails)
+            : supplier.paymentMethodDetails;
+        } catch (e) {
+          console.error(`Error parsing paymentMethodDetails for supplier ${supplier.id}:`, e);
+        }
+      }
+
+      return {
+        ...supplier,
+        id: supplierId,
+        paymentMethodDetails: paymentDetails,
+        grossEarnings,
+        tdsDeducted,
+        netEarnings,
+        totalEarnings: netEarnings, // For backward compatibility
+        pendingEarnings,
+        bookingCount: bookings.length
+      };
+    });
+
+    res.json({
+      success: true,
+      suppliers: suppliersWithEarnings
+    });
+  } catch (error) {
+    console.error('❌ Get suppliers with payment details error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to fetch suppliers with payment details'
+    });
+  }
+});
+
+// Verify supplier payment details (admin)
+app.post('/api/admin/suppliers/:id/verify-payment', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const supplierId = parseInt(id);
+
+    if (isNaN(supplierId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid supplier ID'
+      });
+    }
+
+    const supplier = await prisma.supplier.update({
+      where: { id: supplierId },
+      data: {
+        paymentDetailsVerified: true,
+        paymentDetailsVerifiedAt: new Date()
+      }
+    });
+
+    res.json({
+      success: true,
+      message: 'Payment details verified successfully',
+      supplier: {
+        ...supplier,
+        id: String(supplier.id)
+      }
+    });
+  } catch (error) {
+    console.error('❌ Verify payment details error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to verify payment details'
+    });
+  }
+});
+
+// Approve supplier (admin)
+app.post('/api/admin/suppliers/:id/approve', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log(`📝 Approve supplier request - ID from params: "${id}" (type: ${typeof id})`);
+
+    const supplierId = parseInt(id);
+    console.log(`   Parsed supplier ID: ${supplierId} (isNaN: ${isNaN(supplierId)})`);
+
+    if (isNaN(supplierId)) {
+      console.error(`   ❌ Invalid supplier ID: "${id}"`);
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid supplier ID',
+        message: 'Supplier ID must be a valid number'
+      });
+    }
+
+    // Check if supplier exists with retry logic
+    let existingSupplier = null;
+    let findAttempts = 0;
+    const MAX_FIND_RETRIES = 3;
+
+    while (findAttempts < MAX_FIND_RETRIES && !existingSupplier) {
+      try {
+        existingSupplier = await prisma.supplier.findUnique({
+          where: { id: supplierId }
+        });
+        break; // Success, exit retry loop
+      } catch (dbError) {
+        findAttempts++;
+        console.error(`   Database error finding supplier (attempt ${findAttempts}/${MAX_FIND_RETRIES}):`, dbError.message);
+
+        // If it's a connection error and we have retries left, wait and retry
+        if (findAttempts < MAX_FIND_RETRIES && (
+          dbError.message?.includes('connection') ||
+          dbError.message?.includes('timeout') ||
+          dbError.code === 'P1001' ||
+          dbError.code === 'P1017' ||
+          dbError.code === 'P1008'
+        )) {
+          console.log(`   Retrying in ${findAttempts * 500}ms...`);
+          await new Promise(resolve => setTimeout(resolve, findAttempts * 500));
+          continue;
+        }
+        // Not a retryable error, break and handle below
+        throw dbError;
+      }
+    }
+
+    if (!existingSupplier) {
+      console.error(`   ❌ Supplier not found with ID: ${supplierId}`);
+      return res.status(404).json({
+        success: false,
+        error: 'Supplier not found',
+        message: 'No supplier found with the provided ID'
+      });
+    }
+
+    console.log(`   ✅ Found supplier: ${existingSupplier.email} (status: ${existingSupplier.status})`);
+
+    if (existingSupplier.status === 'approved') {
+      return res.status(400).json({
+        success: false,
+        error: 'Already approved',
+        message: 'This supplier is already approved'
+      });
+    }
+
+    // Update supplier status to approved with retry logic
+    let updatedSupplier = null;
+    let updateAttempts = 0;
+    const MAX_UPDATE_RETRIES = 3;
+
+    while (updateAttempts < MAX_UPDATE_RETRIES && !updatedSupplier) {
+      try {
+        updatedSupplier = await prisma.supplier.update({
+          where: { id: supplierId },
+          data: {
+            status: 'approved'
+          },
+          select: {
+            id: true,
+            email: true,
+            fullName: true,
+            companyName: true,
+            status: true
+          }
+        });
+        break; // Success, exit retry loop
+      } catch (dbError) {
+        updateAttempts++;
+        console.error(`   Database error updating supplier (attempt ${updateAttempts}/${MAX_UPDATE_RETRIES}):`, dbError.message);
+
+        // If it's a connection error and we have retries left, wait and retry
+        if (updateAttempts < MAX_UPDATE_RETRIES && (
+          dbError.message?.includes('connection') ||
+          dbError.message?.includes('timeout') ||
+          dbError.code === 'P1001' ||
+          dbError.code === 'P1017' ||
+          dbError.code === 'P1008'
+        )) {
+          console.log(`   Retrying in ${updateAttempts * 500}ms...`);
+          await new Promise(resolve => setTimeout(resolve, updateAttempts * 500));
+          continue;
+        }
+        // Not a retryable error, throw
+        throw dbError;
+      }
+    }
+
+    if (!updatedSupplier) {
+      throw new Error('Failed to update supplier after retries');
+    }
+
+    console.log(`✅ Supplier ${supplierId} (${updatedSupplier.email}) approved by admin`);
+
+    res.json({
+      success: true,
+      message: 'Supplier approved successfully',
+      supplier: {
+        ...updatedSupplier,
+        id: String(updatedSupplier.id)
+      }
+    });
+  } catch (error) {
+    console.error('❌ Supplier approval error:', error);
+    console.error('   Error message:', error.message);
+    console.error('   Error code:', error.code);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to approve supplier',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Reject supplier (admin)
+app.post('/api/admin/suppliers/:id/reject', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rejectionReason } = req.body;
+    console.log(`📝 Reject supplier request - ID from params: "${id}" (type: ${typeof id})`);
+
+    const supplierId = parseInt(id);
+    console.log(`   Parsed supplier ID: ${supplierId} (isNaN: ${isNaN(supplierId)})`);
+
+    if (isNaN(supplierId)) {
+      console.error(`   ❌ Invalid supplier ID: "${id}"`);
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid supplier ID',
+        message: 'Supplier ID must be a valid number'
+      });
+    }
+
+    // Check if supplier exists with retry logic
+    let existingSupplier = null;
+    let findAttempts = 0;
+    const MAX_FIND_RETRIES = 3;
+
+    while (findAttempts < MAX_FIND_RETRIES && !existingSupplier) {
+      try {
+        existingSupplier = await prisma.supplier.findUnique({
+          where: { id: supplierId }
+        });
+        break; // Success, exit retry loop
+      } catch (dbError) {
+        findAttempts++;
+        console.error(`   Database error finding supplier (attempt ${findAttempts}/${MAX_FIND_RETRIES}):`, dbError.message);
+
+        // If it's a connection error and we have retries left, wait and retry
+        if (findAttempts < MAX_FIND_RETRIES && (
+          dbError.message?.includes('connection') ||
+          dbError.message?.includes('timeout') ||
+          dbError.code === 'P1001' ||
+          dbError.code === 'P1017' ||
+          dbError.code === 'P1008'
+        )) {
+          console.log(`   Retrying in ${findAttempts * 500}ms...`);
+          await new Promise(resolve => setTimeout(resolve, findAttempts * 500));
+          continue;
+        }
+        // Not a retryable error, break and handle below
+        throw dbError;
+      }
+    }
+
+    if (!existingSupplier) {
+      console.error(`   ❌ Supplier not found with ID: ${supplierId}`);
+      return res.status(404).json({
+        success: false,
+        error: 'Supplier not found',
+        message: 'No supplier found with the provided ID'
+      });
+    }
+
+    console.log(`   ✅ Found supplier: ${existingSupplier.email} (status: ${existingSupplier.status})`);
+
+    // Update supplier status to rejected with retry logic
+    let updatedSupplier = null;
+    let updateAttempts = 0;
+    const MAX_UPDATE_RETRIES = 3;
+
+    while (updateAttempts < MAX_UPDATE_RETRIES && !updatedSupplier) {
+      try {
+        updatedSupplier = await prisma.supplier.update({
+          where: { id: supplierId },
+          data: {
+            status: 'rejected'
+          },
+          select: {
+            id: true,
+            email: true,
+            fullName: true,
+            companyName: true,
+            status: true
+          }
+        });
+        break; // Success, exit retry loop
+      } catch (dbError) {
+        updateAttempts++;
+        console.error(`   Database error updating supplier (attempt ${updateAttempts}/${MAX_UPDATE_RETRIES}):`, dbError.message);
+
+        // If it's a connection error and we have retries left, wait and retry
+        if (updateAttempts < MAX_UPDATE_RETRIES && (
+          dbError.message?.includes('connection') ||
+          dbError.message?.includes('timeout') ||
+          dbError.code === 'P1001' ||
+          dbError.code === 'P1017' ||
+          dbError.code === 'P1008'
+        )) {
+          console.log(`   Retrying in ${updateAttempts * 500}ms...`);
+          await new Promise(resolve => setTimeout(resolve, updateAttempts * 500));
+          continue;
+        }
+        // Not a retryable error, throw
+        throw dbError;
+      }
+    }
+
+    if (!updatedSupplier) {
+      throw new Error('Failed to update supplier after retries');
+    }
+
+    console.log(`❌ Supplier ${supplierId} (${updatedSupplier.email}) rejected by admin. Reason: ${rejectionReason || 'Not provided'}`);
+
+    res.json({
+      success: true,
+      message: 'Supplier rejected successfully',
+      supplier: {
+        ...updatedSupplier,
+        id: String(updatedSupplier.id)
+      }
+    });
+  } catch (error) {
+    console.error('❌ Supplier rejection error:', error);
+    console.error('   Error message:', error.message);
+    console.error('   Error code:', error.code);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to reject supplier',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Submit tour for review
+app.post('/api/tours/:id/submit', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const tourId = parseInt(id);
+
+    if (isNaN(tourId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid tour ID',
+        message: 'Tour ID must be a valid number'
+      });
+    }
+
+    // Check if tour exists
+    const existingTour = await prisma.tour.findUnique({
+      where: { id: tourId }
+    });
+
+    if (!existingTour) {
+      return res.status(404).json({
+        success: false,
+        error: 'Tour not found',
+        message: 'No tour found with the provided ID'
+      });
+    }
+
+    // Allow submitting draft, pending, and approved tours for review
+    // This allows suppliers to resubmit edited tours
+    if (existingTour.status !== 'draft' && existingTour.status !== 'pending' && existingTour.status !== 'approved') {
+      return res.status(400).json({
+        success: false,
+        error: 'Cannot submit tour',
+        message: 'Only draft, pending, or approved tours can be submitted for review'
+      });
+    }
+
+    console.log(`📝 Updating tour ${tourId} status to pending...`);
+
+    // Update status to pending (unless already approved)
+    const updateStartTime = Date.now();
+    const updatedTour = await prisma.tour.update({
+      where: { id: tourId },
+      data: {
+        status: existingTour.status === 'approved' ? 'approved' : 'pending' // Approved tours stay approved
+      }
+    });
+    console.log(`   ✅ Status updated (took ${Date.now() - updateStartTime}ms)`);
+
+    // Parse JSON fields (avoid parsing large images here to keep response fast)
+    const formattedTour = {
+      ...updatedTour,
+      id: String(updatedTour.id),
+      locations: JSON.parse(updatedTour.locations || '[]'),
+      images: [], // Skip parsing base64 images on submit response
+      languages: JSON.parse(updatedTour.languages || '[]'),
+      highlights: updatedTour.highlights ? JSON.parse(updatedTour.highlights || '[]') : [],
+      tourTypes: updatedTour.tourTypes ? JSON.parse(updatedTour.tourTypes || '[]') : []
+    };
+
+    console.log(`✅ Tour submitted for review: ${tourId}`);
+
+    res.json({
+      success: true,
+      message: 'Tour submitted for review successfully',
+      tour: formattedTour
+    });
+  } catch (error) {
+    console.error('Tour submit error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to submit tour for review'
+    });
+  }
+});
+
+// ==================== BOOKING ENDPOINTS ====================
+
+/**
+ * Someone is filling in the booking form.
+ *
+ * A booking row only exists once the form is submitted, so every visitor who
+ * types their details and then hesitates, closes the tab, or gets stuck at the
+ * card step used to be invisible to us. They are the warmest leads we get —
+ * they have a tour, a date and a phone number — so they get a push the moment
+ * they are reachable, long before any money is involved.
+ *
+ * Fire-and-forget by design: this must never slow down or break the form.
+ */
+const inquiryAlerted = new Map(); // key -> timestamp, so one person alerts once
+
+app.post('/api/booking-inquiry', async (req, res) => {
+  // Answer first. An alert is never worth making the customer wait.
+  res.json({ success: true });
+
+  try {
+    const { tourId, tourTitle, bookingDate, numberOfGuests, customerName, customerEmail, customerPhone, totalAmount, currency, specialRequests } = req.body || {};
+
+    // Nothing to act on without a way to reach them.
+    if (!customerEmail && !customerPhone) return;
+
+    // One alert per person per tour per hour — a form fires this on every
+    // keystroke pause, and 30 pushes for one customer is the same as none.
+    const key = `${tourId || '?'}:${(customerEmail || customerPhone).toLowerCase()}`;
+    const last = inquiryAlerted.get(key);
+    if (last && Date.now() - last < 60 * 60 * 1000) return;
+    inquiryAlerted.set(key, Date.now());
+
+    // Keep the map from growing forever on a long-lived process.
+    if (inquiryAlerted.size > 500) {
+      const cutoff = Date.now() - 60 * 60 * 1000;
+      for (const [k, t] of inquiryAlerted) if (t < cutoff) inquiryAlerted.delete(k);
+    }
+
+    let title = tourTitle;
+    if (!title && tourId) {
+      const tour = await prisma.tour.findUnique({
+        where: { id: parseInt(tourId) },
+        select: { title: true },
+      });
+      title = tour?.title;
+    }
+
+    await sendInquiryAlert({
+      tourTitle: title,
+      customerName: customerName || 'Someone',
+      customerEmail,
+      customerPhone,
+      guests: numberOfGuests,
+      amount: totalAmount,
+      currency: currency || 'USD',
+      bookingDate,
+      specialRequests,
+    });
+  } catch (error) {
+    console.error('Booking inquiry alert failed (non-fatal):', error.message);
+  }
+});
+
+// Create a new booking
+app.post('/api/bookings', async (req, res) => {
+  try {
+    const { tourId, bookingDate, numberOfGuests, customerName, customerEmail, customerPhone, specialRequests, totalAmount, currency } = req.body;
+
+    if (!tourId || !bookingDate || !numberOfGuests || !customerName || !customerEmail || !totalAmount) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields',
+        message: 'Please provide all required booking information'
+      });
+    }
+
+    // Get tour to find supplier
+    const tour = await prisma.tour.findUnique({
+      where: { id: parseInt(tourId) }
+    });
+
+    if (!tour) {
+      return res.status(404).json({
+        success: false,
+        error: 'Tour not found',
+        message: 'The tour you are trying to book does not exist'
+      });
+    }
+
+    // Minimum notice, enforced here as well as in the calendar.
+    //
+    // India runs on our own operations and can confirm same-day. Everywhere
+    // else we are an agent and the operator has to be told first. One day
+    // blocks the same-day booking that caused the Kyoto failure.
+    //
+    // "Today" is computed in the TOUR's timezone, not the server's. Render runs
+    // in UTC and Japan is nine hours ahead: at 06:00 in Tokyo on the 9th it is
+    // still 21:00 on the 8th here, so a UTC "today" would read a Japanese
+    // same-day booking as next-day and let it through — exactly the case this
+    // exists to stop.
+    const TOUR_TZ = {
+      india: 'Asia/Kolkata', japan: 'Asia/Tokyo', thailand: 'Asia/Bangkok',
+      'sri lanka': 'Asia/Colombo', uae: 'Asia/Dubai', nepal: 'Asia/Kathmandu',
+    };
+    const tourCountry = String(tour.country || '').trim().toLowerCase();
+    // Colosseum timed-entry slots sell out days ahead, so near-term dates are
+    // never real; match the 3-day floor the calendar uses.
+    const leadDays = tourCountry === 'india' ? 0
+      : /colosseum|coliseum/i.test(String(tour.title || '')) ? 3 : 1;
+    if (leadDays > 0) {
+      const tz = TOUR_TZ[tourCountry] || 'Asia/Dubai';
+      // en-CA gives YYYY-MM-DD
+      const [ty, tm, td] = new Intl.DateTimeFormat('en-CA', {
+        timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+      }).format(new Date()).split('-').map(Number);
+      const earliest = new Date(Date.UTC(ty, tm - 1, td));
+      earliest.setUTCDate(earliest.getUTCDate() + leadDays);
+      const [by, bm, bd] = String(bookingDate).slice(0, 10).split('-').map(Number);
+      const wanted = new Date(Date.UTC(by, (bm || 1) - 1, bd || 1));
+      if (wanted < earliest) {
+        const earliestStr = earliest.toISOString().slice(0, 10);
+        return res.status(400).json({
+          success: false,
+          error: 'Too soon to book',
+          message: `This tour needs at least ${leadDays} ${leadDays === 1 ? "day's" : "days'"} notice so the local operator can confirm your place. The earliest date we can take is ${earliestStr}.`,
+          earliestDate: earliestStr
+        });
+      }
+    }
+
+    // Get supplier contact info
+    const supplier = await prisma.supplier.findUnique({
+      where: { id: tour.supplierId },
+      select: {
+        id: true,
+        fullName: true,
+        companyName: true,
+        email: true,
+        phone: true,
+        whatsapp: true
+      }
+    });
+
+    // Create booking
+    const booking = await prisma.booking.create({
+      data: {
+        tourId: parseInt(tourId),
+        supplierId: tour.supplierId,
+        customerName,
+        customerEmail,
+        customerPhone: customerPhone || null,
+        bookingDate,
+        numberOfGuests: parseInt(numberOfGuests),
+        totalAmount: parseFloat(totalAmount),
+        currency: currency || 'INR',
+        specialRequests: specialRequests || null,
+        status: 'pending_payment',
+        paymentStatus: 'pending'
+      },
+      include: {
+        tour: {
+          select: {
+            title: true,
+            slug: true
+          }
+        }
+      }
+    });
+
+    console.log('✅ Booking created:', booking.id);
+
+    // Get full tour details for notifications
+    const tourDetails = await prisma.tour.findUnique({
+      where: { id: parseInt(tourId) },
+      select: { title: true, slug: true, city: true, country: true }
+    });
+
+    // Generate booking reference number
+    const bookingReference = `GWL-${booking.id.toString().padStart(6, '0')}-${new Date().getFullYear()}`;
+
+    // Instant phone push alert (non-blocking) — new booking (pending payment)
+    sendBookingAlert({
+      reference: bookingReference,
+      tourTitle: tourDetails?.title,
+      customerName,
+      customerPhone,
+      customerEmail,
+      guests: numberOfGuests,
+      amount: totalAmount,
+      currency: currency || 'USD',
+      specialRequests,
+    });
+
+    // WhatsApp link generation remains for the response
+    let whatsappLink = null;
+    if (supplier?.whatsapp) {
+      const whatsappMessage = encodeURIComponent(
+        `Hello! I have a new booking for ${tourDetails?.title || 'your tour'}.\n\n` +
+        `Customer: ${customerName}\n` +
+        `Date: ${(() => { const [y,m,d] = bookingDate.split('-').map(Number); return new Date(y,m-1,d).toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }); })()}\n` +
+        `Guests: ${numberOfGuests}\n` +
+        `Total: ${currency || 'INR'} ${totalAmount}\n` +
+        `${customerPhone ? `Customer Phone: ${customerPhone}\n` : ''}` +
+        `${customerEmail ? `Customer Email: ${customerEmail}` : ''}`
+      );
+      // Remove any non-digit characters except + for WhatsApp number
+      const cleanWhatsApp = supplier.whatsapp.replace(/[^\d+]/g, '');
+      whatsappLink = `https://wa.me/${cleanWhatsApp}?text=${whatsappMessage}`;
+      console.log(`📱 WhatsApp link generated for guide: ${whatsappLink}`);
+    }
+
+    res.json({
+      success: true,
+      message: 'Booking created successfully',
+      booking: {
+        ...booking,
+        id: String(booking.id),
+        tourId: String(booking.tourId),
+        supplierId: String(booking.supplierId),
+        bookingReference
+      },
+      supplier: supplier ? {
+        fullName: supplier.fullName,
+        companyName: supplier.companyName,
+        email: supplier.email,
+        phone: supplier.phone,
+        whatsapp: supplier.whatsapp,
+        whatsappLink // Include WhatsApp link for easy contact
+      } : null
+    });
+  } catch (error) {
+    console.error('Booking creation error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to create booking'
+    });
+  }
+});
+
+// Get bookings for a supplier
+app.get('/api/suppliers/:supplierId/bookings', async (req, res) => {
+  try {
+    const { supplierId } = req.params;
+    const supplierIdInt = parseInt(supplierId);
+
+    if (isNaN(supplierIdInt)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid supplier ID',
+        message: 'Supplier ID must be a valid number'
+      });
+    }
+
+    const bookings = await prisma.booking.findMany({
+      where: {
+        supplierId: supplierIdInt
+      },
+      include: {
+        tour: {
+          select: {
+            id: true,
+            title: true,
+            slug: true,
+            city: true,
+            country: true
+          }
+        }
+      },
+      orderBy: {
+        createdAt: 'desc'
+      }
+    });
+
+    const formattedBookings = bookings.map(booking => ({
+      ...booking,
+      id: String(booking.id),
+      tourId: String(booking.tourId),
+      supplierId: String(booking.supplierId),
+      bookingReference: `GWL-${booking.id.toString().padStart(6, '0')}-${new Date(booking.createdAt).getFullYear()}`
+    }));
+
+    res.json({
+      success: true,
+      bookings: formattedBookings
+    });
+  } catch (error) {
+    console.error('Get supplier bookings error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to fetch bookings'
+    });
+  }
+});
+
+// Get booking confirmation/invoice
+app.get('/api/bookings/:bookingId/confirmation', async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    const bookingIdInt = parseInt(bookingId);
+
+    if (isNaN(bookingIdInt)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid booking ID'
+      });
+    }
+
+    const booking = await prisma.booking.findUnique({
+      where: { id: bookingIdInt },
+      include: {
+        tour: {
+          select: {
+            title: true,
+            slug: true,
+            city: true,
+            country: true
+          }
+        },
+        supplier: {
+          select: {
+            fullName: true,
+            companyName: true,
+            email: true,
+            phone: true,
+            whatsapp: true
+          }
+        }
+      }
+    });
+
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        error: 'Booking not found'
+      });
+    }
+
+    const bookingReference = `GWL-${booking.id.toString().padStart(6, '0')}-${new Date(booking.createdAt).getFullYear()}`;
+
+    res.json({
+      success: true,
+      booking: {
+        ...booking,
+        id: String(booking.id),
+        tourId: String(booking.tourId),
+        supplierId: String(booking.supplierId),
+        bookingReference
+      }
+    });
+  } catch (error) {
+    console.error('Get booking confirmation error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to fetch booking confirmation'
+    });
+  }
+});
+
+// Review links in already-sent emails point at this backend's onrender.com URL
+// (bad FRONTEND_URL) — forward them to the real review page on the Next.js site.
+app.get('/review/:token', (req, res) => {
+  res.redirect(302, `https://www.globewithlocals.com/review/${req.params.token}`);
+});
+
+// ==================== PAYMENT ENDPOINTS ====================
+
+/**
+ * Create a Razorpay order.
+ *
+ * Razorpay's edge returns HTTP 406 to requests from our Render (US) server IP.
+ * When RAZORPAY_PROXY_URL is set, we route the order-creation request through a
+ * Cloudflare Worker (a non-blocked origin) instead of calling Razorpay directly.
+ * When it is NOT set, we fall back to the normal SDK call — so this change is a
+ * no-op until the proxy env vars are configured.
+ */
+async function createRazorpayOrder({ amount, currency, receipt, notes, keyId, keySecret }) {
+  const proxyUrl = process.env.RAZORPAY_PROXY_URL;
+
+  if (proxyUrl) {
+    const auth = Buffer.from(`${keyId}:${keySecret}`).toString('base64');
+    const resp = await fetch(`${proxyUrl.replace(/\/$/, '')}/v1/orders`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/json',
+        'x-proxy-secret': process.env.RAZORPAY_PROXY_SECRET || ''
+      },
+      body: JSON.stringify({ amount, currency, receipt, notes })
+    });
+
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      // Re-shape so the caller's catch block logs/surfaces it like an SDK error.
+      const err = new Error(data?.error?.description || `Razorpay proxy returned HTTP ${resp.status}`);
+      err.statusCode = resp.status;
+      err.error = data?.error;
+      throw err;
+    }
+    console.log('✅ Razorpay order created via proxy:', data.id);
+    return data;
+  }
+
+  // Fallback: direct SDK call (original behaviour)
+  const razorpay = new Razorpay({ key_id: keyId, key_secret: keySecret });
+  return razorpay.orders.create({ amount, currency, receipt, notes });
+}
+
+// Currencies guests can pay in (all 2-decimal minor units — JPY etc. excluded on purpose)
+const SUPPORTED_PAY_CURRENCIES = ['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'SGD', 'AED', 'CHF', 'NZD', 'INR'];
+
+// USD-based FX rates, cached 6h; serves stale rates if the feed is down
+let fxCache = { rates: null, fetchedAt: 0 };
+async function getFxRates() {
+  if (fxCache.rates && Date.now() - fxCache.fetchedAt < 6 * 3600 * 1000) return fxCache.rates;
+  try {
+    const resp = await fetch('https://open.er-api.com/v6/latest/USD');
+    const data = await resp.json();
+    if (data && data.result === 'success' && data.rates) {
+      fxCache = { rates: data.rates, fetchedAt: Date.now() };
+      return data.rates;
+    }
+  } catch (e) {
+    console.error('FX rate fetch failed:', e.message);
+  }
+  if (fxCache.rates) return fxCache.rates;
+  throw new Error('FX rates unavailable');
+}
+
+// Rates for the checkout currency dropdown
+app.get('/api/payments/fx-rates', async (req, res) => {
+  try {
+    const rates = await getFxRates();
+    const out = {};
+    for (const c of SUPPORTED_PAY_CURRENCIES) if (rates[c]) out[c] = rates[c];
+    res.json({ success: true, base: 'USD', currencies: SUPPORTED_PAY_CURRENCIES, rates: out });
+  } catch (e) {
+    res.status(503).json({ success: false, error: 'FX rates unavailable' });
+  }
+});
+
+// Create Razorpay order
+app.post('/api/payments/create-order', async (req, res) => {
+  try {
+    const { bookingId, amount, currency, payCurrency } = req.body;
+
+    if (!bookingId || !amount) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields',
+        message: 'Booking ID and amount are required'
+      });
+    }
+
+    // Initialize Razorpay instance
+    const razorpayKeyId = process.env.RAZORPAY_KEY_ID;
+    const razorpayKeySecret = process.env.RAZORPAY_KEY_SECRET;
+
+    console.log('Razorpay config check:', {
+      hasKeyId: !!razorpayKeyId,
+      keyIdLength: razorpayKeyId?.length,
+      keyIdPreview: razorpayKeyId ? `${razorpayKeyId.substring(0, 15)}...` : 'MISSING',
+      hasKeySecret: !!razorpayKeySecret,
+      keySecretLength: razorpayKeySecret?.length
+    });
+
+    if (!razorpayKeyId || !razorpayKeySecret) {
+      console.error('❌ Razorpay keys missing from environment variables');
+      return res.status(500).json({
+        success: false,
+        error: 'Payment gateway configuration error',
+        message: 'Razorpay API keys are not configured. Please contact support.'
+      });
+    }
+
+    // Convert to the guest's chosen payment currency (amount arrives in the
+    // booking's base currency, minor units). Falls back to the base currency
+    // untouched if the rate lookup fails — payment must not block on FX.
+    let orderAmount = amount;
+    let orderCurrency = currency || 'USD';
+    if (payCurrency && payCurrency !== orderCurrency && SUPPORTED_PAY_CURRENCIES.includes(payCurrency)) {
+      try {
+        const rates = await getFxRates();
+        const from = rates[orderCurrency];
+        const to = rates[payCurrency];
+        if (from && to) {
+          orderAmount = Math.round(amount * (to / from));
+          orderCurrency = payCurrency;
+        }
+      } catch (e) {
+        console.error('FX conversion failed, charging in base currency:', e.message);
+      }
+    }
+
+    // Create Razorpay order
+    console.log('Creating Razorpay order with:', {
+      amount: orderAmount,
+      currency: orderCurrency,
+      bookingId
+    });
+
+    let order;
+    try {
+      order = await createRazorpayOrder({
+        amount: orderAmount, // Amount in minor units (cents/paise)
+        currency: orderCurrency,
+        receipt: `booking_${bookingId}`,
+        notes: {
+          bookingId: bookingId.toString()
+        },
+        keyId: razorpayKeyId,
+        keySecret: razorpayKeySecret
+      });
+      console.log('✅ Razorpay order created:', order.id);
+    } catch (orderError) {
+      console.error('❌ Razorpay order creation failed:', {
+        error: orderError.message,
+        statusCode: orderError.statusCode,
+        errorDescription: orderError.error?.description,
+        errorCode: orderError.error?.code
+      });
+      return res.status(500).json({
+        success: false,
+        error: 'Order creation failed',
+        message: orderError.error?.description || orderError.message || 'Failed to create payment order. Please check Razorpay configuration.'
+      });
+    }
+
+    // Update booking with order ID
+    await prisma.booking.update({
+      where: { id: parseInt(bookingId) },
+      data: {
+        razorpayOrderId: order.id
+      }
+    });
+
+    console.log('✅ Razorpay order created successfully:', {
+      orderId: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      status: order.status
+    });
+
+    res.json({
+      success: true,
+      order: order,
+      razorpayKeyId: razorpayKeyId
+    });
+  } catch (error) {
+    console.error('Payment order creation error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to create payment order'
+    });
+  }
+});
+
+// Razorpay webhook — server-to-server safety net for /api/verify-payment.
+//
+// verify-payment is only ever called by the customer's browser after checkout.
+// If that call never happens — tab closed, network dropped, redirect failed —
+// Razorpay has captured the money but the booking sits on pending_payment
+// forever, with no invoice and no emails to anyone. That happened to booking
+// 124 (order_TW0LOMxRV4bczR, $32 captured, never recorded).
+//
+// Razorpay posts here directly and retries on failure, so it does not depend on
+// the customer's browser at all. On payment.captured we look the booking up by
+// order id and hand it to verify-payment, which already does the invoice, the
+// customer/guide/admin emails and the push alert. Re-using that route rather
+// than repeating it here keeps a single confirmation path — and verify-payment
+// already refuses to confirm the same booking twice, so a browser callback and
+// a webhook arriving together is harmless.
+app.post('/api/razorpay-webhook', async (req, res) => {
+  try {
+    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    if (!webhookSecret) {
+      console.error('❌ WEBHOOK: RAZORPAY_WEBHOOK_SECRET is not set — rejecting');
+      return res.status(500).json({ success: false, error: 'Webhook not configured' });
+    }
+
+    // Signature must be checked against the raw bytes Razorpay signed.
+    const signature = req.headers['x-razorpay-signature'];
+    if (!signature || !req.rawBody) {
+      console.error('❌ WEBHOOK: missing signature header or raw body');
+      return res.status(400).json({ success: false, error: 'Missing signature' });
+    }
+
+    const expected = createHmac('sha256', webhookSecret).update(req.rawBody).digest('hex');
+    if (expected !== signature) {
+      console.error('❌ WEBHOOK: signature mismatch — ignoring request');
+      return res.status(400).json({ success: false, error: 'Invalid signature' });
+    }
+
+    const event = req.body?.event;
+    const payment = req.body?.payload?.payment?.entity;
+    console.log('🔔 WEBHOOK received:', { event, paymentId: payment?.id, orderId: payment?.order_id });
+
+    // Only captured payments confirm a booking. Everything else is acknowledged
+    // so Razorpay stops retrying, but changes nothing.
+    if (event !== 'payment.captured' || !payment?.order_id || !payment?.id) {
+      return res.json({ success: true, ignored: true });
+    }
+
+    const booking = await prisma.booking.findFirst({
+      where: { razorpayOrderId: payment.order_id },
+      select: { id: true, paymentStatus: true, razorpayPaymentId: true }
+    });
+
+    if (!booking) {
+      // Acknowledge anyway: retrying will not make a missing booking appear.
+      console.error('❌ WEBHOOK: no booking for order', payment.order_id);
+      return res.json({ success: true, ignored: true, reason: 'booking not found' });
+    }
+
+    if (booking.paymentStatus === 'paid' && booking.razorpayPaymentId) {
+      console.log('ℹ️ WEBHOOK: booking already confirmed, nothing to do:', booking.id);
+      return res.json({ success: true, alreadyConfirmed: true });
+    }
+
+    // verify-payment re-checks this signature against the same key secret, so it
+    // validates exactly as the browser's would have.
+    const paymentSignature = createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+      .update(`${payment.order_id}|${payment.id}`)
+      .digest('hex');
+
+    const verifyResponse = await fetch(`http://127.0.0.1:${PORT}/api/verify-payment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: payment.order_id,
+        razorpay_payment_id: payment.id,
+        razorpay_signature: paymentSignature,
+        bookingId: booking.id
+      })
+    });
+    const verifyResult = await verifyResponse.json().catch(() => ({}));
+
+    if (!verifyResponse.ok || !verifyResult.success) {
+      // Return 500 so Razorpay retries — the payment is real and still unrecorded.
+      console.error('❌ WEBHOOK: verify-payment failed for booking', booking.id, verifyResult);
+      return res.status(500).json({ success: false, error: 'Confirmation failed' });
+    }
+
+    console.log('✅ WEBHOOK: recovered booking', booking.id, 'from payment', payment.id);
+    return res.json({ success: true, bookingId: booking.id, recovered: true });
+  } catch (error) {
+    console.error('❌ WEBHOOK error:', error);
+    // 500 makes Razorpay retry rather than drop the event.
+    return res.status(500).json({ success: false, error: 'Webhook processing failed' });
+  }
+});
+
+// Verify Razorpay payment (Production Marketplace Standard)
+app.post('/api/verify-payment', async (req, res) => {
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, bookingId } = req.body;
+
+    console.log('🔐 Payment verification request received:', {
+      bookingId,
+      razorpay_order_id,
+      razorpay_payment_id: razorpay_payment_id ? `${razorpay_payment_id.substring(0, 10)}...` : 'MISSING',
+      hasSignature: !!razorpay_signature
+    });
+
+    // SECURITY CHECK 1: Validate all required fields
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !bookingId) {
+      console.error('❌ SECURITY: Missing required payment verification fields');
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields',
+        message: 'All payment verification fields are required'
+      });
+    }
+
+    // SECURITY CHECK 2: Verify booking exists and get current state
+    const existingBooking = await prisma.booking.findUnique({
+      where: { id: parseInt(bookingId) },
+      select: {
+        id: true,
+        razorpayOrderId: true,
+        razorpayPaymentId: true,
+        paymentStatus: true,
+        status: true,
+        totalAmount: true,
+        currency: true
+      }
+    });
+
+    if (!existingBooking) {
+      console.error('❌ SECURITY: Booking not found:', bookingId);
+      return res.status(404).json({
+        success: false,
+        error: 'Booking not found',
+        message: 'Invalid booking ID'
+      });
+    }
+
+    // SECURITY CHECK 3: Prevent duplicate payment confirmations
+    if (existingBooking.paymentStatus === 'paid' && existingBooking.razorpayPaymentId) {
+      console.warn('⚠️ SECURITY: Attempted duplicate payment confirmation for booking:', bookingId);
+      return res.status(400).json({
+        success: false,
+        error: 'Payment already confirmed',
+        message: 'This booking has already been paid and confirmed.'
+      });
+    }
+
+    // SECURITY CHECK 4: Verify order_id matches the one stored in booking
+    if (existingBooking.razorpayOrderId && existingBooking.razorpayOrderId !== razorpay_order_id) {
+      console.error('❌ SECURITY: Order ID mismatch:', {
+        stored: existingBooking.razorpayOrderId,
+        received: razorpay_order_id
+      });
+      return res.status(400).json({
+        success: false,
+        error: 'Order ID mismatch',
+        message: 'Payment verification failed. Order ID does not match.'
+      });
+    }
+
+    // SECURITY CHECK 5: Verify signature using Razorpay's algorithm with secret key
+    const razorpayKeySecret = process.env.RAZORPAY_KEY_SECRET;
+    if (!razorpayKeySecret) {
+      console.error('❌ SECURITY: Razorpay secret key not configured');
+      return res.status(500).json({
+        success: false,
+        error: 'Server configuration error',
+        message: 'Payment verification service unavailable'
+      });
+    }
+
+    const hmac = createHmac('sha256', razorpayKeySecret);
+    hmac.update(razorpay_order_id + '|' + razorpay_payment_id);
+    const generatedSignature = hmac.digest('hex');
+    const isValid = generatedSignature === razorpay_signature;
+
+    console.log('🔐 Signature verification:', {
+      isValid,
+      generatedSignature: `${generatedSignature.substring(0, 20)}...`,
+      receivedSignature: `${razorpay_signature.substring(0, 20)}...`
+    });
+
+    if (!isValid) {
+      console.error('❌ SECURITY: Payment signature verification failed for booking:', bookingId);
+      console.error('   This could be a fake payment attempt or tampered data');
+
+      // Update booking status to payment_failed
+      try {
+        await prisma.booking.update({
+          where: { id: parseInt(bookingId) },
+          data: {
+            status: 'payment_failed',
+            paymentStatus: 'failed',
+            updatedAt: new Date()
+          }
+        });
+        console.log('✅ Booking status updated to payment_failed due to signature verification failure');
+      } catch (updateError) {
+        console.error('❌ Failed to update booking status:', updateError);
+      }
+
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid payment signature',
+        message: 'Payment verification failed. Please contact support if payment was deducted.'
+      });
+    }
+
+    // SECURITY CHECK 6: All checks passed - Update booking with payment info
+    console.log('✅ SECURITY: All verification checks passed, updating booking...');
+
+    // Generate booking reference
+    const bookingReference = `GWL-${existingBooking.id.toString().padStart(6, '0')}-${new Date().getFullYear()}`;
+
+    // Get full booking data for invoice generation and email
+    const bookingForInvoice = await prisma.booking.findUnique({
+      where: { id: parseInt(bookingId) },
+      include: {
+        tour: {
+          select: {
+            title: true,
+            city: true,
+            country: true
+          }
+        },
+        supplier: {
+          select: {
+            fullName: true,
+            companyName: true,
+            email: true,
+            phone: true,
+            whatsapp: true
+          }
+        }
+      }
+    });
+
+    // Generate invoice PDF and upload to R2
+    let invoiceUrl = null;
+    let invoicePDFBase64 = null;
+    try {
+      invoicePDFBase64 = await generateInvoicePDF({
+        ...bookingForInvoice,
+        bookingReference,
+        razorpayPaymentId: razorpay_payment_id,
+        razorpayOrderId: razorpay_order_id
+      });
+
+      // Upload to R2 using utility
+      const { uploadDocument } = await import('./utils/r2.js');
+      invoiceUrl = await uploadDocument(
+        invoicePDFBase64,
+        'invoices',
+        `invoice_${bookingId}_${Date.now()}`
+      );
+
+      console.log('✅ Invoice PDF uploaded to R2:', invoiceUrl);
+    } catch (invoiceError) {
+      console.error('❌ Failed to generate/upload invoice PDF:', invoiceError);
+      // Don't fail payment verification if invoice generation fails
+    }
+
+    const booking = await prisma.booking.update({
+      where: { id: parseInt(bookingId) },
+      data: {
+        razorpayPaymentId: razorpay_payment_id,
+        razorpaySignature: razorpay_signature,
+        razorpayOrderId: razorpay_order_id,
+        paymentStatus: 'paid',
+        status: 'confirmed',
+        confirmedAt: new Date(),
+        invoiceUrl: invoiceUrl,
+        // Stamped here rather than by the sweeper so a guest who pays between
+        // two sweeps can never receive a "you didn't pay" nudge afterwards.
+        recoveredAt: new Date(),
+        updatedAt: new Date()
+      },
+      include: {
+        tour: {
+          select: {
+            title: true,
+            city: true,
+            country: true
+          }
+        },
+        supplier: {
+          select: {
+            fullName: true,
+            companyName: true,
+            email: true,
+            phone: true,
+            whatsapp: true
+          }
+        }
+      }
+    });
+
+    console.log('✅ SECURITY: Payment verified and booking confirmed:', {
+      bookingId: booking.id,
+      paymentId: razorpay_payment_id,
+      orderId: razorpay_order_id,
+      amount: existingBooking.totalAmount,
+      currency: existingBooking.currency,
+      timestamp: new Date().toISOString(),
+      invoiceUrl: invoiceUrl
+    });
+
+    // Send confirmation email to customer
+    try {
+      await sendBookingConfirmationEmail(
+        booking.customerEmail,
+        booking.customerName,
+        {
+          bookingReference,
+          bookingId: booking.id,
+          tourTitle: booking.tour.title,
+          city: booking.tour.city,
+          country: booking.tour.country,
+          bookingDate: booking.bookingDate,
+          numberOfGuests: booking.numberOfGuests,
+          totalAmount: booking.totalAmount,
+          currency: booking.currency,
+          supplierName: booking.supplier.fullName || booking.supplier.companyName || 'Your Supplier',
+          supplierEmail: booking.supplier.email,
+          supplierPhone: booking.supplier.phone,
+          supplierWhatsApp: booking.supplier.whatsapp,
+          razorpayPaymentId: razorpay_payment_id,
+          razorpayOrderId: razorpay_order_id,
+          paymentStatus: 'Paid',
+          invoiceUrl: invoiceUrl,
+          invoicePDFBase64: invoicePDFBase64 // Pass base64 PDF for attachment
+        }
+      );
+      console.log(`✅ Booking confirmation email sent to customer`);
+      // Add delay to avoid Resend rate limit (2 req/sec)
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    } catch (emailError) {
+      console.error(`❌ Failed to send booking confirmation email:`, emailError);
+      // Don't fail payment verification if email fails
+    }
+
+    // Send notification email to supplier/guide
+    try {
+      await sendGuideBookingNotificationEmail(
+        booking.supplier.email,
+        booking.supplier.fullName || booking.supplier.companyName || 'Supplier',
+        {
+          bookingReference,
+          bookingId: booking.id,
+          tourTitle: booking.tour.title,
+          customerName: booking.customerName,
+          customerEmail: booking.customerEmail,
+          customerPhone: booking.customerPhone,
+          bookingDate: booking.bookingDate,
+          numberOfGuests: booking.numberOfGuests,
+          totalAmount: booking.totalAmount,
+          currency: booking.currency,
+          specialRequests: existingBooking.specialRequests,
+          invoiceUrl: invoiceUrl,
+          invoicePDFBase64: invoicePDFBase64
+        }
+      );
+      console.log(`✅ Booking notification email sent to supplier/guide`);
+      // Add delay to avoid Resend rate limit (2 req/sec)
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    } catch (emailError) {
+      console.error(`❌ Failed to send booking confirmation request email to supplier:`, emailError);
+      // Don't fail payment verification if email fails
+    }
+
+    // Send admin notification email
+    try {
+      await sendAdminPaymentNotificationEmail({
+        bookingReference,
+        bookingId: booking.id,
+        tourTitle: booking.tour.title,
+        city: booking.tour.city,
+        country: booking.tour.country,
+        customerName: booking.customerName,
+        customerEmail: booking.customerEmail,
+        customerPhone: booking.customerPhone,
+        bookingDate: booking.bookingDate,
+        numberOfGuests: booking.numberOfGuests,
+        totalAmount: booking.totalAmount,
+        currency: booking.currency,
+        supplierName: booking.supplier.fullName || booking.supplier.companyName || 'Unknown',
+        supplierEmail: booking.supplier.email,
+        supplierPhone: booking.supplier.phone,
+        razorpayPaymentId: razorpay_payment_id,
+        razorpayOrderId: razorpay_order_id,
+        invoiceUrl: invoiceUrl
+      });
+      console.log(`✅ Admin payment notification email sent`);
+    } catch (emailError) {
+      console.error(`❌ Failed to send admin payment notification email:`, emailError);
+      // Don't fail payment verification if email fails
+    }
+
+    // Return success response with bookingId (production standard)
+    res.json({
+      success: true,
+      bookingId: booking.id.toString()
+    });
+  } catch (error) {
+    console.error('Payment verification error:', error);
+
+    // Update booking status to payment_failed on error
+    try {
+      if (req.body.bookingId) {
+        await prisma.booking.update({
+          where: { id: parseInt(req.body.bookingId) },
+          data: {
+            status: 'payment_failed',
+            paymentStatus: 'failed',
+            updatedAt: new Date()
+          }
+        });
+        console.log('✅ Booking status updated to payment_failed due to verification error');
+      }
+    } catch (updateError) {
+      console.error('❌ Failed to update booking status on error:', updateError);
+    }
+
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to verify payment'
+    });
+  }
+});
+
+// Legacy guide-confirm endpoint (no longer used - guides are auto-confirmed)
+app.get('/api/bookings/guide-confirm', async (req, res) => {
+  const frontendUrl = process.env.FRONTEND_URL || process.env.VITE_FRONTEND_URL || 'http://localhost:3000';
+  return res.redirect(`${frontendUrl}`);
+});
+
+// Mark booking as payment_failed when user closes Razorpay modal without paying
+app.post('/api/bookings/:bookingId/mark-payment-failed', async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+
+    console.log('📝 Marking booking as payment_failed:', bookingId);
+
+    // Verify booking exists and is still pending
+    const booking = await prisma.booking.findUnique({
+      where: { id: parseInt(bookingId) },
+      select: {
+        id: true,
+        paymentStatus: true,
+        status: true,
+        customerName: true,
+        customerPhone: true,
+        customerEmail: true,
+        totalAmount: true,
+        currency: true,
+        createdAt: true,
+        tour: { select: { title: true } }
+      }
+    });
+
+    if (!booking) {
+      console.error('❌ Booking not found:', bookingId);
+      return res.status(404).json({
+        success: false,
+        error: 'Booking not found'
+      });
+    }
+
+    // Only update if still pending payment
+    if (booking.paymentStatus === 'pending' && (booking.status === 'pending' || booking.status === 'pending_payment')) {
+      await prisma.booking.update({
+        where: { id: parseInt(bookingId) },
+        data: {
+          status: 'payment_failed',
+          paymentStatus: 'failed',
+          updatedAt: new Date()
+        }
+      });
+      console.log('✅ Booking marked as payment_failed:', bookingId);
+      // Alert immediately so a stuck customer can be rescued while they're
+      // still trying — not discovered days later in the Razorpay dashboard.
+      sendPaymentFailedAlert({
+        customerName: booking.customerName,
+        customerPhone: booking.customerPhone,
+        customerEmail: booking.customerEmail,
+        amount: booking.totalAmount,
+        currency: booking.currency,
+        tourTitle: booking.tour?.title,
+        reference: `GWL-${booking.id.toString().padStart(6, '0')}-${new Date(booking.createdAt).getFullYear()}`,
+        reason: 'Customer payment did not complete (modal closed or failed)',
+      });
+
+      // Reach the guest too, not just the admin. A ten-hour gap between a
+      // failed checkout and a message is long enough for them to book the same
+      // tour somewhere else — which is exactly what happened on 2026-09-07.
+      sendInstantRecovery(booking.id);
+    } else {
+      console.log('⚠️ Booking already processed, not updating:', {
+        bookingId,
+        currentStatus: booking.status,
+        currentPaymentStatus: booking.paymentStatus
+      });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('❌ Error marking booking as payment_failed:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to update booking status'
+    });
+  }
+});
+
+// ==================== ADMIN BOOKING ENDPOINTS ====================
+
+// Get all bookings for admin (with payment status)
+app.get('/api/admin/bookings', verifyAdmin, async (req, res) => {
+  try {
+    const { paymentStatus, status, startDate, endDate } = req.query;
+
+    const where = {};
+
+    if (paymentStatus) {
+      where.paymentStatus = paymentStatus;
+    }
+
+    if (status) {
+      where.status = status;
+    }
+
+    if (startDate || endDate) {
+      where.createdAt = {};
+      if (startDate) {
+        where.createdAt.gte = new Date(startDate);
+      }
+      if (endDate) {
+        where.createdAt.lte = new Date(endDate);
+      }
+    }
+
+    const bookings = await prisma.booking.findMany({
+      where,
+      include: {
+        tour: {
+          select: {
+            id: true,
+            title: true,
+            slug: true,
+            city: true,
+            country: true,
+            category: true
+          }
+        },
+        supplier: {
+          select: {
+            id: true,
+            fullName: true,
+            companyName: true,
+            email: true,
+            phone: true,
+            whatsapp: true
+          }
+        },
+        tourOption: {
+          select: {
+            optionTitle: true,
+            price: true
+          }
+        }
+      },
+      orderBy: {
+        createdAt: 'desc'
+      }
+    });
+
+    const formattedBookings = bookings.map(booking => ({
+      ...booking,
+      id: String(booking.id),
+      tourId: String(booking.tourId),
+      supplierId: String(booking.supplierId),
+      bookingReference: `GWL-${booking.id.toString().padStart(6, '0')}-${new Date(booking.createdAt).getFullYear()}`
+    }));
+
+    res.json({
+      success: true,
+      bookings: formattedBookings,
+      total: formattedBookings.length,
+      paid: formattedBookings.filter(b => b.paymentStatus === 'paid').length,
+      pending: formattedBookings.filter(b => b.paymentStatus === 'pending').length
+    });
+  } catch (error) {
+    console.error('Get admin bookings error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to fetch bookings'
+    });
+  }
+});
+
+// ==================== PUBLIC TOUR ENDPOINTS ====================
+
+// Diagnostic endpoint to check tours in database
+// Debug endpoint (DISABLED in production for security)
+app.get('/api/debug/tours', async (req, res) => {
+  // SECURITY: Disable in production
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(403).json({
+      success: false,
+      error: 'Forbidden',
+      message: 'This endpoint is disabled in production'
+    });
+  }
+  try {
+    const allTours = await prisma.tour.findMany({
+      select: {
+        id: true,
+        title: true,
+        city: true,
+        country: true,
+        status: true,
+        createdAt: true
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 50
+    });
+
+    const statusBreakdown = allTours.reduce((acc, tour) => {
+      acc[tour.status] = (acc[tour.status] || 0) + 1;
+      return acc;
+    }, {});
+
+    res.json({
+      success: true,
+      total: allTours.length,
+      statusBreakdown,
+      tours: allTours
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// ==================== IN-MEMORY CACHE FOR PUBLIC TOURS ====================
+// Caches tour results to avoid hitting the slow Render free-tier DB on every request
+const toursCache = new Map(); // key: "city:country:category" → { data, timestamp }
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+function getCacheKey(city, country, category) {
+  return `${(city || '').toLowerCase()}:${(country || '').toLowerCase()}:${(category || '').toLowerCase()}`;
+}
+
+// Get public tours by city (for public site)
+// DB-level pagination for GET /api/public/tours?limit=N[&offset=M]. Counts and fetches only the
+// requested page (best-reviewed first, then oldest-first) instead of loading a city's entire list
+// into memory per cache miss: Rome alone is ~3,000 tours / 4MB, and doing that per request is what
+// exhausted the 512MB instance. `count` is the TRUE total. Any failure (e.g. the review columns not
+// migrated yet) returns false so the route falls back to the legacy full-list path unchanged.
+const PAGED_LIST_SELECT = {
+  id: true, supplierId: true, title: true, slug: true, country: true, city: true, category: true,
+  locations: true, images: true, languages: true, highlights: true, duration: true,
+  pricePerPerson: true, currency: true, shortDescription: true, included: true, notIncluded: true,
+  meetingPoint: true, tourTypes: true, status: true, createdAt: true, updatedAt: true,
+  reviewAvg: true, reviewCount: true
+};
+const pagedToursCache = new Map(); // key -> { at, payload }
+const PAGED_TTL_MS = 60 * 1000;
+const safeJson = (txt, fallback) => { try { return txt ? JSON.parse(txt) : fallback; } catch { return fallback; } };
+
+async function servePagedTours(req, res) {
+  try {
+    const { city, country, category } = req.query;
+    const limit = Math.min(parseInt(req.query.limit, 10), 1000);
+    const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+    const key = [city, country, category, limit, offset].map(v => String(v ?? '').toLowerCase()).join('|');
+    const hit = pagedToursCache.get(key);
+    if (hit && Date.now() - hit.at < PAGED_TTL_MS) { res.json(hit.payload); return true; }
+
+    const where = { status: 'approved' };
+    if (city) where.city = { equals: city, mode: 'insensitive' };
+    if (country) where.country = { equals: country, mode: 'insensitive' };
+    if (category) where.category = category;
+
+    const [total, rows] = await Promise.all([
+      prisma.tour.count({ where }),
+      prisma.tour.findMany({
+        where, select: PAGED_LIST_SELECT, take: limit, skip: offset,
+        orderBy: [{ reviewCount: { sort: 'desc', nulls: 'last' } }, { id: 'asc' }]
+      })
+    ]);
+
+    let suppliers = [], options = [];
+    if (rows.length > 0) {
+      [suppliers, options] = await Promise.all([
+        prisma.supplier.findMany({ where: { id: { in: [...new Set(rows.map(r => r.supplierId))] } }, select: { id: true, fullName: true, companyName: true } }).catch(() => []),
+        prisma.tourOption.findMany({
+          where: { tourId: { in: rows.map(r => r.id) } },
+          select: { id: true, tourId: true, optionTitle: true, price: true, groupPricingTiers: true, currency: true, sortOrder: true },
+          orderBy: { sortOrder: 'asc' }
+        }).catch(() => [])
+      ]);
+    }
+    const supplierMap = new Map(suppliers.map(x => [x.id, x]));
+    const optionsMap = new Map();
+    for (const o of options) { if (!optionsMap.has(o.tourId)) optionsMap.set(o.tourId, []); optionsMap.get(o.tourId).push(o); }
+
+    const tours = rows.map(t => {
+      const imgs = safeJson(t.images, []);
+      const sup = supplierMap.get(t.supplierId);
+      return {
+        id: String(t.id), supplierId: String(t.supplierId),
+        title: t.title || 'Untitled Tour', slug: t.slug || `tour-${t.id}`,
+        country: t.country || '', city: t.city || '', category: t.category || '',
+        locations: safeJson(t.locations, []),
+        images: imgs.length > 0 && typeof imgs[0] === 'string' ? [imgs[0]] : [],
+        languages: safeJson(t.languages, []), highlights: safeJson(t.highlights, []),
+        duration: t.duration || '', pricePerPerson: t.pricePerPerson || 0, currency: t.currency || 'INR',
+        shortDescription: t.shortDescription || null, included: t.included || '', notIncluded: t.notIncluded || null,
+        meetingPoint: t.meetingPoint || null, tourTypes: safeJson(t.tourTypes, []),
+        status: t.status || 'draft', createdAt: t.createdAt, updatedAt: t.updatedAt,
+        reviewAvg: t.reviewAvg ?? null, reviewCount: t.reviewCount ?? 0,
+        supplier: sup ? { ...sup, id: String(sup.id) } : null,
+        options: (optionsMap.get(t.id) || []).slice(0, 5).map(o => {
+          const { pricingType, pricing_type, ...clean } = o;
+          return { ...clean, id: String(o.id), tourId: String(o.tourId), groupPricingTiers: safeJson(o.groupPricingTiers, null) };
+        })
+      };
+    });
+
+    const payload = { success: true, tours, count: total, total, offset, returned: tours.length, hasMore: offset + tours.length < total };
+    pagedToursCache.set(key, { at: Date.now(), payload });
+    if (pagedToursCache.size > 400) pagedToursCache.delete(pagedToursCache.keys().next().value);
+    res.json(payload);
+    return true;
+  } catch (e) {
+    console.warn('paged tours fast path failed, falling back to the legacy list:', e.message);
+    return false;
+  }
+}
+
+// Real pagination for the public tour list. Without ?limit the full list is returned exactly as
+// before (older callers). With ?limit=N[&offset=M] the page is the city's tours in creation order
+// (oldest first: the first scrape of a city is its best-selling listings, the long tail comes
+// later), and the response says how many exist in total and whether more follow, so a caller can
+// never mistake a page for the whole city. `count` stays the TOTAL for every caller that reads it
+// (limit=1 is the cheap way to ask "how many live tours does X have").
+function paginateTours(list, query) {
+  const limit = parseInt(query.limit, 10);
+  if (!Number.isFinite(limit) || limit <= 0) {
+    return { tours: list, count: list.length, total: list.length, hasMore: false };
+  }
+  const offset = Math.max(0, parseInt(query.offset, 10) || 0);
+  const ordered = [...list].sort((a, b) => Number(a.id) - Number(b.id));
+  const page = ordered.slice(offset, offset + Math.min(limit, 1000));
+  return { tours: page, count: list.length, total: list.length, offset, returned: page.length, hasMore: offset + page.length < list.length };
+}
+
+app.get('/api/public/tours', async (req, res) => {
+  const startTime = Date.now();
+  console.log('📋 GET /api/public/tours - Request received');
+  console.log('   Query params:', req.query);
+  console.log('   Headers:', req.headers);
+  console.log('   Origin:', req.headers.origin);
+
+  try {
+    const { city, country, category, status = 'approved' } = req.query;
+
+    if (parseInt(req.query.limit, 10) > 0 && await servePagedTours(req, res)) return;
+
+    console.log('📋 Fetching public tours:', { city, country, category, status });
+    console.log('   Request received at:', new Date().toISOString());
+
+    // Check in-memory cache first
+    const cacheKey = getCacheKey(city, country, category);
+    const cached = toursCache.get(cacheKey);
+    if (cached && (Date.now() - cached.timestamp) < CACHE_TTL_MS) {
+      console.log(`   ⚡ CACHE HIT for "${cacheKey}" (${cached.data.length} tours, age: ${Math.round((Date.now() - cached.timestamp) / 1000)}s)`);
+      const totalTime = Date.now() - startTime;
+      console.log(`   ✅ Response sent in ${totalTime}ms (cached)`);
+      return res.json({ success: true, ...paginateTours(cached.data, req.query), cached: true });
+    }
+    console.log(`   📡 CACHE MISS for "${cacheKey}" - fetching from database...`);
+
+    // ALWAYS fetch only approved tours for public API (ignore status param for security)
+    // Build where clause - fetch all approved tours, then filter in memory for case-insensitive matching
+    const where = {
+      status: 'approved' // Always use 'approved' for public API, ignore query param
+    };
+
+    // Only add category filter (exact match is fine for category)
+    if (category) {
+      where.category = category;
+    }
+
+    // Note: We'll filter city/country in memory for case-insensitive matching
+    console.log('   Where clause:', JSON.stringify(where, null, 2));
+    console.log('   Will filter by city/country in memory:', { city, country });
+    console.log('   ⚠️  Status param ignored - always fetching approved tours only');
+
+    // Retry logic for Render free tier database connection issues
+    let tours = null;
+    let findAttempts = 0;
+    const MAX_FIND_RETRIES = 3;
+
+    while (findAttempts < MAX_FIND_RETRIES && !tours) {
+      try {
+        // OPTIMIZED: Build where clause with database-level filtering (FAST)
+        const queryStartTime = Date.now();
+        const where = {
+          status: 'approved'
+        };
+
+        // Add city/country filters at database level (case-insensitive)
+        if (city) {
+          where.city = { equals: city, mode: 'insensitive' };
+        }
+        if (country) {
+          where.country = { equals: country, mode: 'insensitive' };
+        }
+        // Add category filter at database level
+        if (category) {
+          where.category = category;
+        }
+
+        // Step 1: Fetch tours with optimized fields (NO fullDescription, NO all images)
+        tours = await prisma.tour.findMany({
+          where,
+          select: {
+            id: true,
+            supplierId: true,
+            title: true,
+            slug: true,
+            country: true,
+            city: true,
+            category: true,
+            locations: true,
+            images: true, // We'll extract only first image URL in formatting
+            languages: true,
+            highlights: true,
+            duration: true,
+            pricePerPerson: true,
+            currency: true,
+            shortDescription: true,
+            // fullDescription: REMOVED - not needed for list view, saves huge payload
+            included: true,
+            notIncluded: true,
+            meetingPoint: true,
+            tourTypes: true,
+            status: true,
+            createdAt: true,
+            updatedAt: true
+            // Note: groupPrice and maxGroupSize don't exist on Tour model - they're on TourOption
+          },
+          orderBy: {
+            createdAt: 'desc'
+          }
+          // No `take` here on purpose. This query is already narrowed to one
+          // city, so the result is small — but a cap of 50 silently dropped the
+          // 51st tour with nothing in the response to say so. Agra crossed 50
+          // and the oldest listing (taj-mahal-official-guided-tour, a champion)
+          // vanished from its own city page while still returning 200 on its
+          // detail URL, so nothing looked broken. A city page must show every
+          // approved tour it has; if this ever needs limiting, it needs real
+          // pagination that tells the caller there is more.
+        });
+
+        const queryTime = Date.now() - queryStartTime;
+        console.log(`   ✅ Fetched ${tours.length} tours in ${queryTime}ms`);
+        // Loud warning rather than silent truncation, if a city ever gets huge.
+        if (tours.length > 300) {
+          console.warn(`   ⚠️  ${tours.length} tours returned for "${cacheKey}" — consider real pagination`);
+        }
+
+        // Step 2: Fetch suppliers and options in parallel (FAST)
+        if (tours.length > 0) {
+          const supplierIds = [...new Set(tours.map(t => t.supplierId))];
+          const tourIds = tours.map(t => t.id);
+
+          const [suppliers, allOptions] = await Promise.all([
+            // Fetch all suppliers at once
+            prisma.supplier.findMany({
+              where: { id: { in: supplierIds } },
+              select: {
+                id: true,
+                fullName: true,
+                companyName: true
+              }
+            }).catch(() => []),
+            // Fetch all options at once
+            prisma.tourOption.findMany({
+              where: { tourId: { in: tourIds } },
+              select: {
+                id: true,
+                tourId: true,
+                optionTitle: true,
+                price: true,
+                groupPricingTiers: true,
+                currency: true,
+                sortOrder: true
+                // Note: groupPrice and maxGroupSize are commented out in schema, so not available
+              },
+              orderBy: { sortOrder: 'asc' },
+              take: 500 // Max 500 options total
+            }).catch(() => [])
+          ]);
+
+          // Step 3: Attach suppliers and options to tours (FAST - in memory)
+          const supplierMap = new Map(suppliers.map(s => [s.id, s]));
+          const optionsMap = new Map();
+
+          allOptions.forEach(opt => {
+            if (!optionsMap.has(opt.tourId)) {
+              optionsMap.set(opt.tourId, []);
+            }
+            optionsMap.get(opt.tourId).push(opt);
+          });
+
+          tours = tours.map(tour => ({
+            ...tour,
+            supplier: supplierMap.get(tour.supplierId) || null,
+            options: (optionsMap.get(tour.id) || []).slice(0, 5) // Max 5 options per tour
+          }));
+
+          console.log(`   ✅ Enriched tours with suppliers and options`);
+        }
+
+        console.log(`   ✅ Fetched ${tours.length} tours in ${Date.now() - queryStartTime}ms (filtered at DB level)`);
+        break; // Success, exit retry loop
+      } catch (dbError) {
+        findAttempts++;
+        console.error(`   Database error fetching tours (attempt ${findAttempts}/${MAX_FIND_RETRIES}):`, dbError.message);
+
+        // If it's a connection error and we have retries left, wait and retry
+        if (findAttempts < MAX_FIND_RETRIES && (
+          dbError.message?.includes('connection') ||
+          dbError.message?.includes('timeout') ||
+          dbError.code === 'P1001' ||
+          dbError.code === 'P1017' ||
+          dbError.code === 'P1008'
+        )) {
+          console.log(`   Retrying in ${findAttempts * 500}ms...`);
+          await new Promise(resolve => setTimeout(resolve, findAttempts * 500));
+          continue;
+        }
+        // Not a retryable error, throw
+        throw dbError;
+      }
+    }
+
+    // Ensure tours is always an array (never null)
+    if (!tours) {
+      tours = [];
+      console.log(`   ⚠️  Tours query returned null, using empty array`);
+    }
+
+    if (!Array.isArray(tours)) {
+      console.error(`   ❌ Tours is not an array! Type: ${typeof tours}, Value:`, tours);
+      tours = [];
+    }
+
+    console.log(`   ✅ Final result: Found ${tours.length} tours`);
+
+    // CRITICAL: If we have tours but formattedTours will be empty, log it
+    if (tours.length > 0) {
+      console.log(`   🔍 About to format ${tours.length} tours...`);
+    }
+
+    // Log tour statuses and city/country for debugging
+    if (tours.length > 0) {
+      const statusCounts = tours.reduce((acc, tour) => {
+        acc[tour.status] = (acc[tour.status] || 0) + 1;
+        return acc;
+      }, {});
+      console.log(`   📊 Tour status breakdown:`, statusCounts);
+      console.log(`   📍 Final tours being returned:`, tours.slice(0, 5).map(t => ({
+        id: t.id,
+        title: t.title?.substring(0, 30),
+        city: t.city,
+        country: t.country,
+        status: t.status
+      })));
+    } else {
+      console.log(`   ⚠️  No tours found with filters:`, { city, country, category, status });
+      console.log(`   🔍 This means either:`);
+      console.log(`      1. No approved tours exist in database`);
+      console.log(`      2. All approved tours were filtered out by city/country`);
+      console.log(`      3. There's a bug in the filtering logic`);
+      // Log what tours exist in database (for debugging)
+      try {
+        const allTours = await prisma.tour.findMany({
+          where: { status: 'approved' },
+          select: { id: true, title: true, status: true, city: true, country: true },
+          take: 10
+        });
+        console.log(`   🔍 Approved tours in database (first 10):`, allTours.map(t => ({ id: t.id, title: t.title.substring(0, 40), status: t.status, city: t.city, country: t.country })));
+
+        // Check if there's a case mismatch
+        if (city || country) {
+          const matchingTours = allTours.filter(t => {
+            const cityMatch = !city || t.city?.toLowerCase() === city.toLowerCase();
+            const countryMatch = !country || t.country?.toLowerCase() === country.toLowerCase();
+            return cityMatch && countryMatch;
+          });
+          console.log(`   🔍 Case-insensitive match found ${matchingTours.length} tours`);
+        }
+      } catch (debugError) {
+        console.error(`   ❌ Could not fetch debug tour list:`, debugError.message);
+      }
+    }
+
+    // Parse JSON fields with error handling
+    // Format tours - ensure ALL tours are returned even if formatting fails
+    let formattedTours = tours.map(tour => {
+      try {
+        // Safe JSON parsing with fallbacks
+        let locations = [];
+        try {
+          locations = JSON.parse(tour.locations || '[]');
+        } catch (e) {
+          console.warn(`   ⚠️  Failed to parse locations for tour ${tour.id}:`, e.message);
+          locations = [];
+        }
+
+        // OPTIMIZED: Only get first image URL (not all base64 images)
+        let images = [];
+        try {
+          const allImages = JSON.parse(tour.images || '[]');
+          // Only include first image URL if it exists (saves massive payload)
+          if (allImages.length > 0 && typeof allImages[0] === 'string') {
+            images = [allImages[0]]; // Just first image URL
+          }
+        } catch (e) {
+          console.warn(`   ⚠️  Failed to parse images for tour ${tour.id}:`, e.message);
+          images = [];
+        }
+
+        let languages = [];
+        try {
+          languages = JSON.parse(tour.languages || '[]');
+        } catch (e) {
+          console.warn(`   ⚠️  Failed to parse languages for tour ${tour.id}:`, e.message);
+          languages = ['English']; // Default fallback
+        }
+
+        let highlights = [];
+        try {
+          highlights = tour.highlights ? JSON.parse(tour.highlights) : [];
+        } catch (e) {
+          console.warn(`   ⚠️  Failed to parse highlights for tour ${tour.id}:`, e.message);
+          highlights = [];
+        }
+
+        // Format options safely
+        let formattedOptions = [];
+        try {
+          if (tour.options && Array.isArray(tour.options)) {
+            formattedOptions = tour.options.map(opt => {
+              try {
+                if (!opt || !opt.id) return null;
+                // Explicitly format option fields (exclude pricingType if it somehow exists)
+                const { pricingType, pricing_type, ...cleanOpt } = opt;
+
+                // Parse groupPricingTiers if it exists (stored as JSON string in DB)
+                let groupPricingTiers = null;
+                if (opt.groupPricingTiers) {
+                  try {
+                    groupPricingTiers = typeof opt.groupPricingTiers === 'string'
+                      ? JSON.parse(opt.groupPricingTiers)
+                      : opt.groupPricingTiers;
+                  } catch (e) {
+                    console.warn(`   ⚠️  Failed to parse groupPricingTiers for option ${opt.id}:`, e.message);
+                    groupPricingTiers = null;
+                  }
+                }
+
+                return {
+                  ...cleanOpt,
+                  id: String(opt.id),
+                  tourId: String(opt.tourId || tour.id),
+                  groupPricingTiers: groupPricingTiers
+                };
+              } catch (optError) {
+                console.warn(`   ⚠️  Error formatting option ${opt?.id || 'unknown'} for tour ${tour.id}:`, optError.message);
+                return null;
+              }
+            }).filter(opt => opt !== null);
+          }
+        } catch (optionsError) {
+          console.warn(`   ⚠️  Error processing options for tour ${tour.id}:`, optionsError.message);
+          formattedOptions = [];
+        }
+
+        // Build tour object - include all essential fields
+        const formattedTour = {
+          id: String(tour.id),
+          supplierId: String(tour.supplierId),
+          title: tour.title || 'Untitled Tour',
+          slug: tour.slug || `tour-${tour.id}`,
+          country: tour.country || '',
+          city: tour.city || '',
+          category: tour.category || '',
+          locations,
+          images,
+          languages,
+          highlights,
+          duration: tour.duration || '',
+          pricePerPerson: tour.pricePerPerson || 0,
+          currency: tour.currency || 'INR',
+          shortDescription: tour.shortDescription || null,
+          // fullDescription: REMOVED - not needed for list view, saves huge payload
+          included: tour.included || '',
+          notIncluded: tour.notIncluded || null,
+          meetingPoint: tour.meetingPoint || null,
+          guideType: tour.guideType || null,
+          tourTypes: tour.tourTypes ? (() => {
+            try {
+              return JSON.parse(tour.tourTypes);
+            } catch (e) {
+              return [];
+            }
+          })() : [],
+          status: tour.status || 'draft',
+          createdAt: tour.createdAt,
+          updatedAt: tour.updatedAt,
+          supplier: tour.supplier ? {
+            ...tour.supplier,
+            id: String(tour.supplier.id)
+          } : null,
+          options: formattedOptions
+        };
+
+        return formattedTour;
+      } catch (parseError) {
+        console.error(`   ❌ Error formatting tour ${tour.id}:`, parseError);
+        console.error(`   Stack:`, parseError.stack);
+        // Return minimal safe tour data - but still return it!
+        return {
+          id: String(tour.id),
+          supplierId: String(tour.supplierId || ''),
+          title: tour.title || 'Untitled Tour',
+          slug: tour.slug || `tour-${tour.id}`,
+          city: tour.city || '',
+          country: tour.country || '',
+          category: tour.category || '',
+          locations: [],
+          images: [],
+          languages: ['English'],
+          highlights: [],
+          duration: tour.duration || '',
+          pricePerPerson: tour.pricePerPerson || 0,
+          currency: tour.currency || 'INR',
+          fullDescription: tour.fullDescription || '',
+          included: tour.included || '',
+          status: tour.status || 'draft',
+          supplier: null,
+          options: []
+        };
+      }
+    });
+
+    // Filter out null/undefined tours but log if we're losing tours
+    const beforeFilter = formattedTours.length;
+    formattedTours = formattedTours.filter(tour => tour !== null && tour !== undefined);
+    if (beforeFilter !== formattedTours.length) {
+      console.warn(`   ⚠️  Filtered out ${beforeFilter - formattedTours.length} null/undefined tours`);
+    }
+
+    console.log(`   ✅ Formatted ${formattedTours.length} tours successfully`);
+
+    // CRITICAL CHECK: If we had tours but formattedTours is empty, something went wrong
+    if (tours.length > 0 && formattedTours.length === 0) {
+      console.error(`   ❌ CRITICAL: Had ${tours.length} tours but formattedTours is empty!`);
+      console.error(`   This means all tours failed formatting. Check errors above.`);
+    }
+
+    // Log options statistics
+    const toursWithOptions = formattedTours.filter(t => t.options && t.options.length > 0).length;
+    const toursWithoutOptions = formattedTours.length - toursWithOptions;
+    console.log(`   📊 Tours with options: ${toursWithOptions}, without options: ${toursWithoutOptions}`);
+    console.log(`   📤 Returning ${formattedTours.length} tours to frontend`);
+
+    // Final safety check
+    if (!Array.isArray(formattedTours)) {
+      console.error(`   ❌ formattedTours is not an array! Type: ${typeof formattedTours}`);
+      formattedTours = [];
+    }
+    console.log(`   ✅ Response will include:`, {
+      success: true,
+      toursCount: formattedTours?.length || 0,
+      hasTours: (formattedTours?.length || 0) > 0
+    });
+
+    // Ensure we always return an array, even if empty
+    const response = {
+      success: true,
+      tours: formattedTours || [],
+      count: formattedTours?.length || 0
+    };
+
+    // Store in cache for next request
+    toursCache.set(cacheKey, {
+      data: response.tours,
+      timestamp: Date.now()
+    });
+    console.log(`   💾 Cached ${response.tours.length} tours for key "${cacheKey}" (TTL: ${CACHE_TTL_MS / 1000}s)`);
+
+    const responseTime = Date.now() - startTime;
+    console.log(`   📤 Sending response with ${response.tours.length} tours (took ${responseTime}ms)`);
+    res.json({ success: true, ...paginateTours(response.tours, req.query) });
+  } catch (error) {
+    console.error('❌ Get public tours error:', error);
+    console.error('   Error message:', error.message);
+    console.error('   Error code:', error.code);
+    console.error('   Error stack:', error.stack);
+
+    // Return empty array instead of 500 error to prevent site breakage
+    res.status(200).json({
+      success: true,
+      tours: [],
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined,
+      message: 'Tours temporarily unavailable. Please try again in a moment.'
+    });
+  }
+});
+
+// Clear tours cache (call after tour approval/edit/delete)
+app.post('/api/cache/clear-tours', (req, res) => {
+  const size = toursCache.size;
+  toursCache.clear();
+  console.log(`🗑️  Tours cache cleared (${size} entries removed)`);
+  res.json({ success: true, message: `Cache cleared (${size} entries)` });
+});
+
+// Diagnostic endpoint to check tours for a city (for debugging)
+app.get('/api/debug/tours/:city', async (req, res) => {
+  try {
+    const { city } = req.params;
+    const allTours = await prisma.tour.findMany({
+      where: {
+        city: { contains: city, mode: 'insensitive' }
+      },
+      select: {
+        id: true,
+        title: true,
+        city: true,
+        country: true,
+        status: true,
+        createdAt: true
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    res.json({
+      success: true,
+      city,
+      totalTours: allTours.length,
+      tours: allTours,
+      statusBreakdown: allTours.reduce((acc, t) => {
+        acc[t.status] = (acc[t.status] || 0) + 1;
+        return acc;
+      }, {})
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Get single public tour by slug (SEO-friendly, includes supplier info)
+// IMPORTANT: This route must come BEFORE /api/public/tours/:id to avoid conflicts
+app.get('/api/public/tours/by-slug/:slug', async (req, res) => {
+  try {
+    const { slug } = req.params;
+
+    if (!slug) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing slug',
+        message: 'Tour slug is required'
+      });
+    }
+
+    // Retry logic for Render free tier database connection issues
+    let tour = null;
+    let findAttempts = 0;
+    const MAX_FIND_RETRIES = 3;
+
+    while (findAttempts < MAX_FIND_RETRIES && !tour) {
+      try {
+        tour = await prisma.tour.findUnique({
+          where: { slug },
+          include: {
+            supplier: {
+              select: {
+                id: true,
+                fullName: true,
+                companyName: true,
+                email: true,
+                phone: true,
+                whatsapp: true
+              }
+            },
+            options: {
+              orderBy: {
+                sortOrder: 'asc'
+              }
+            }
+          }
+        });
+        break; // Success, exit retry loop
+      } catch (dbError) {
+        findAttempts++;
+        console.error(`   Database error fetching tour by slug (attempt ${findAttempts}/${MAX_FIND_RETRIES}):`, dbError.message);
+
+        // If it's a connection error and we have retries left, wait and retry
+        if (findAttempts < MAX_FIND_RETRIES && (
+          dbError.message?.includes('connection') ||
+          dbError.message?.includes('timeout') ||
+          dbError.code === 'P1001' ||
+          dbError.code === 'P1017' ||
+          dbError.code === 'P1008'
+        )) {
+          console.log(`   Retrying in ${findAttempts * 500}ms...`);
+          await new Promise(resolve => setTimeout(resolve, findAttempts * 500));
+          continue;
+        }
+        // Not a retryable error, throw
+        throw dbError;
+      }
+    }
+
+    if (!tour) {
+      return res.status(404).json({
+        success: false,
+        error: 'Tour not found',
+        message: 'No tour found with the provided slug'
+      });
+    }
+
+    // Only return approved tours publicly
+    if (tour.status !== 'approved') {
+      return res.status(404).json({
+        success: false,
+        error: 'Tour not found',
+        message: 'This tour is not available'
+      });
+    }
+
+    // Use centralized helper function to ensure reviews is always null
+    const formattedTour = formatTourResponse(tour);
+    if (tour.supplier) {
+      formattedTour.supplier = {
+        ...tour.supplier,
+        id: String(tour.supplier.id)
+      };
+    }
+
+    // Source-listing reviews live in the tours.reviews column as a JSON blob
+    // ({averageRating,totalReviews,guideRating,valueRating,reviews[]}). They are exposed under
+    // a separate key because `reviews` is deliberately forced to null by formatTourResponse.
+    // Keeping them in the DB instead of hardcoded TS maps stops the frontend bundle growing
+    // by megabytes per city (the TS maps are already ~25MB and Render builds in 512MB).
+    if (tour.reviews) {
+      try {
+        // Never show another company's name: scrub author labels and drop any review whose text names one.
+        const COMPETITOR_RE = /klook|tripadvisor|tiqets/i;
+        const rd = JSON.parse(tour.reviews);
+        if (rd && Array.isArray(rd.reviews)) {
+          rd.reviews = rd.reviews
+            .filter(r => !COMPETITOR_RE.test(String(r.text || '')))
+            .map(r => (COMPETITOR_RE.test(String(r.author || '')) ? { ...r, author: 'Traveller' } : r));
+        }
+        formattedTour.reviewData = rd;
+      } catch { /* malformed blob: ignore */ }
+    }
+
+    // CRITICAL: Log pricing data being sent to frontend
+    console.log('═══════════════════════════════════════════════════════════');
+    console.log('📤 API RESPONSE - PRICING DATA (by-slug)');
+    console.log('═══════════════════════════════════════════════════════════');
+    console.log('Tour ID:', formattedTour.id);
+    console.log('Tour Title:', formattedTour.title);
+    console.log('pricePerPerson:', formattedTour.pricePerPerson);
+    console.log('Options count:', formattedTour.options?.length || 0);
+
+    // Check if main tour has groupPricingTiers directly (from database)
+    if (tour.groupPricingTiers) {
+      console.log('📊 Main tour has groupPricingTiers directly:', {
+        type: typeof tour.groupPricingTiers,
+        preview: typeof tour.groupPricingTiers === 'string'
+          ? tour.groupPricingTiers.substring(0, 200)
+          : JSON.stringify(tour.groupPricingTiers).substring(0, 200)
+      });
+    } else {
+      console.warn('⚠️ Main tour does NOT have groupPricingTiers directly');
+    }
+
+    if (formattedTour.options && Array.isArray(formattedTour.options)) {
+      formattedTour.options.forEach((opt, idx) => {
+        console.log(`Option ${idx + 1}:`, {
+          id: opt.id,
+          title: opt.optionTitle,
+          sortOrder: opt.sortOrder,
+          price: opt.price,
+          hasGroupPricingTiers: !!opt.groupPricingTiers,
+          groupPricingTiersType: typeof opt.groupPricingTiers,
+          groupPricingTiersValue: opt.groupPricingTiers,
+          groupPricingTiersPreview: opt.groupPricingTiers
+            ? (typeof opt.groupPricingTiers === 'string'
+              ? opt.groupPricingTiers.substring(0, 200)
+              : JSON.stringify(opt.groupPricingTiers).substring(0, 200))
+            : 'null',
+          allKeys: Object.keys(opt)
+        });
+      });
+    }
+    console.log('═══════════════════════════════════════════════════════════');
+
+    res.json({
+      success: true,
+      tour: formattedTour
+    });
+  } catch (error) {
+    console.error('Get public tour by slug error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to fetch tour'
+    });
+  }
+});
+
+// Get single public tour by ID (includes supplier info)
+app.get('/api/public/tours/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const tourId = parseInt(id);
+
+    if (isNaN(tourId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid tour ID',
+        message: 'Tour ID must be a valid number'
+      });
+    }
+
+    // Retry logic for Render free tier database connection issues
+    let tour = null;
+    let findAttempts = 0;
+    const MAX_FIND_RETRIES = 3;
+
+    while (findAttempts < MAX_FIND_RETRIES && !tour) {
+      try {
+        tour = await prisma.tour.findUnique({
+          where: { id: tourId },
+          include: {
+            supplier: {
+              select: {
+                id: true,
+                fullName: true,
+                companyName: true,
+                email: true,
+                phone: true,
+                whatsapp: true
+              }
+            },
+            options: {
+              orderBy: {
+                sortOrder: 'asc'
+              }
+            }
+          }
+        });
+        break; // Success, exit retry loop
+      } catch (dbError) {
+        findAttempts++;
+        console.error(`   Database error fetching tour (attempt ${findAttempts}/${MAX_FIND_RETRIES}):`, dbError.message);
+
+        // If it's a connection error and we have retries left, wait and retry
+        if (findAttempts < MAX_FIND_RETRIES && (
+          dbError.message?.includes('connection') ||
+          dbError.message?.includes('timeout') ||
+          dbError.code === 'P1001' ||
+          dbError.code === 'P1017' ||
+          dbError.code === 'P1008'
+        )) {
+          console.log(`   Retrying in ${findAttempts * 500}ms...`);
+          await new Promise(resolve => setTimeout(resolve, findAttempts * 500));
+          continue;
+        }
+        // Not a retryable error, throw
+        throw dbError;
+      }
+    }
+
+    if (!tour) {
+      return res.status(404).json({
+        success: false,
+        error: 'Tour not found',
+        message: 'No tour found with the provided ID'
+      });
+    }
+
+    // Only return approved tours publicly
+    if (tour.status !== 'approved') {
+      return res.status(404).json({
+        success: false,
+        error: 'Tour not found',
+        message: 'This tour is not available'
+      });
+    }
+
+    // Use centralized helper function to ensure reviews is always null
+    const formattedTour = formatTourResponse(tour);
+    if (tour.supplier) {
+      formattedTour.supplier = {
+        ...tour.supplier,
+        id: String(tour.supplier.id)
+      };
+    }
+
+    res.json({
+      success: true,
+      tour: formattedTour
+    });
+  } catch (error) {
+    console.error('❌ Get public tour error:', error);
+    console.error('   Error message:', error.message);
+    console.error('   Error code:', error.code);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to fetch tour',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Serve static files from dist folder (frontend build) in production
+if (process.env.NODE_ENV === 'production') {
+  // Try multiple possible paths for dist folder
+  const distPaths = [
+    path.join(__dirname, '../dist'),           // If running from server/, dist is in root
+    path.join(process.cwd(), 'dist'),          // From current working directory
+    path.join(process.cwd(), '../dist')        // From parent directory
+  ];
+
+  // Find the first existing dist path
+  let distPath = null;
+  for (const dist of distPaths) {
+    try {
+      const indexPath = path.join(dist, 'index.html');
+      if (fs.existsSync(indexPath)) {
+        distPath = dist;
+        console.log(`✅ Found dist folder at: ${distPath}`);
+        break;
+      }
+    } catch (e) {
+      // Continue to next path
+    }
+  }
+
+  if (distPath) {
+    // Explicit routes for SEO files (MUST come BEFORE static middleware)
+    app.get('/sitemap.xml', (req, res) => {
+      // Try dist folder first, then public folder as fallback
+      const distSitemapPath = path.join(distPath, 'sitemap.xml');
+      const publicSitemapPath = path.join(__dirname, '..', 'public', 'sitemap.xml');
+
+      let sitemapPath = null;
+      if (fs.existsSync(distSitemapPath)) {
+        sitemapPath = distSitemapPath;
+      } else if (fs.existsSync(publicSitemapPath)) {
+        sitemapPath = publicSitemapPath;
+      }
+
+      if (sitemapPath) {
+        try {
+          // Set proper headers for sitemap (Google requires text/xml)
+          res.type('text/xml');
+          res.setHeader('Content-Type', 'text/xml; charset=utf-8');
+          res.setHeader('Cache-Control', 'public, max-age=3600'); // Cache for 1 hour
+          res.setHeader('X-Content-Type-Options', 'nosniff');
+          // Allow all origins for sitemap (Google needs this)
+          res.setHeader('Access-Control-Allow-Origin', '*');
+          res.sendFile(sitemapPath);
+        } catch (error) {
+          console.error('❌ Error serving sitemap:', error);
+          res.status(500).send('Error serving sitemap');
+        }
+      } else {
+        console.error('❌ Sitemap not found in dist or public folder');
+        res.status(404).type('text/plain').send('Sitemap not found. Please generate it first.');
+      }
+    });
+
+    app.get('/robots.txt', (req, res) => {
+      const robotsPath = path.join(distPath, 'robots.txt');
+      if (fs.existsSync(robotsPath)) {
+        res.type('text/plain');
+        res.setHeader('Cache-Control', 'public, max-age=3600'); // Cache for 1 hour
+        res.sendFile(robotsPath);
+      } else {
+        res.status(404).send('Robots.txt not found');
+      }
+    });
+
+    // ─── 301 Redirects: Old slugs → New SEO-friendly slugs ───
+    const slugRedirects = {
+      // Agra — Round 1
+      'agra-walking-sunrise-tour': 'taj-mahal-sunrise-skip-the-line-tour',
+      'agra-gatimaan-entry-ticket': 'delhi-agra-round-trip-gatimaan-train',
+      'agra-same-guided-tour': 'same-day-delhi-to-agra-tour',
+      'taj-mahal-delhi-guided-tour': 'taj-mahal-same-day-tour-from-delhi',
+      'female-guide-for-taj-mahal': 'taj-mahal-tour-with-female-guide',
+      // Agra — Round 2
+      'taj-mahal-sunrise-sunrise-tour': 'taj-mahal-sunrise-tour-from-agra',
+      'taj-mahal-mahal-private-tour': 'taj-mahal-agra-private-day-tour-with-lunch',
+      'shri-mankameshwar-temple-guided-tour': 'mysteries-of-agra-local-tour',
+      // Delhi — Round 1
+      'agra-fort-sunrise-tour': 'taj-mahal-sunrise-elephant-conservation-tour',
+      'agra-fort-express-tour': 'taj-mahal-same-day-express-train-tour',
+      'india-gate-inclusive-guided-tour': 'golden-triangle-tour-delhi-agra-jaipur',
+      'india-gate-guided-tour-heritage': 'old-new-delhi-guided-tour',
+      'india-gate-triangle-guided-tour': '6-days-golden-triangle-tour-from-delhi',
+      'delhi-luxury-premium-tour': 'taj-mahal-agra-day-trip-luxury-car',
+      'delhi-golden-guided-tour': '5-days-golden-triangle-tour-from-delhi',
+      'agra-overnight-tour': 'delhi-to-agra-overnight-tour',
+      // Delhi — Round 2
+      'india-gate-guided-tour': 'delhi-full-day-guided-tour',
+      'india-gate-half-day-tour': 'old-new-delhi-private-half-day-tour',
+      'golden-triangle-3-day-tour': 'golden-triangle-3-day-tour-from-delhi',
+      // Jaipur — Round 1
+      'elepahnt-village-walking-tour': 'elephant-village-tour-jaipur',
+      'hawa-mahal-food-tour': 'jaipur-heritage-walk-street-food-tour',
+      'hawa-mahal-full-day-tour': 'jaipur-private-full-day-sightseeing-tour',
+      'hawa-mahal-private-tour': 'jaipur-full-day-sightseeing-tour-by-car',
+      'jaipur-enjoy-private-tour': 'jaipur-to-agra-taj-mahal-day-trip',
+      // Jaipur — Round 2
+      'amber-fort-guided-tour': 'jaipur-same-day-tour-from-delhi',
+    };
+
+    app.use((req, res, next) => {
+      // Extract the last segment of the URL path as the potential slug
+      const segments = req.path.split('/').filter(Boolean);
+      const lastSegment = segments[segments.length - 1];
+      if (lastSegment && slugRedirects[lastSegment]) {
+        const newPath = req.path.replace(lastSegment, slugRedirects[lastSegment]);
+        return res.redirect(301, newPath);
+      }
+      next();
+    });
+
+    // Serve static assets (JS, CSS, images, etc.) - AFTER SEO routes
+    app.use(express.static(distPath));
+
+    // Handle React Router - serve index.html for all non-API routes
+    app.get('*', (req, res, next) => {
+      // Don't serve index.html for API routes
+      if (req.path.startsWith('/api')) {
+        return next();
+      }
+      // Don't serve index.html for SEO files (already handled above)
+      if (req.path === '/sitemap.xml' || req.path === '/robots.txt') {
+        return next();
+      }
+      // Serve index.html for all other routes (SPA routing)
+      res.sendFile(path.join(distPath, 'index.html'), (err) => {
+        if (err) {
+          console.error('Error serving index.html:', err);
+          next();
+        }
+      });
+    });
+  } else {
+    console.warn('⚠️  dist folder not found. Frontend will not be served.');
+    console.warn('   Check that Build Command includes "npm run build"');
+    console.warn('   Tried paths:', distPaths);
+  }
+}
+
+// ==================== GUEST REVIEW ENDPOINTS ====================
+
+// Get real guest reviews for a tour (from DB — separate from any seeded content)
+// Live availability: no external source is wired up, so the booking widget
+// always falls back to "assume available" (live:false, never an error).
+app.get('/api/tours/:tourId/availability', (req, res) => {
+  res.json({ success: true, live: false, reason: 'no live availability source' });
+});
+
+// Slim list for the sitemap: slug/city/country/updatedAt of every approved tour in
+// ONE query. The sitemap used to pull each city's full /api/public/tours payload
+// (~1.3KB per tour with descriptions and images), which stops being fetchable in
+// time for Googlebot once a city holds thousands of tours.
+let sitemapToursCache = { at: 0, payload: null };
+app.get('/api/public/sitemap-tours', async (req, res) => {
+  try {
+    if (sitemapToursCache.payload && Date.now() - sitemapToursCache.at < 5 * 60 * 1000) {
+      return res.json(sitemapToursCache.payload);
+    }
+    const rows = await prisma.tour.findMany({
+      where: { status: 'approved' },
+      select: { slug: true, city: true, country: true, updatedAt: true },
+      orderBy: { id: 'asc' }
+    });
+    const payload = {
+      success: true,
+      count: rows.length,
+      tours: rows.map(r => ({ slug: r.slug, city: r.city, country: r.country, updatedAt: r.updatedAt }))
+    };
+    sitemapToursCache = { at: Date.now(), payload };
+    res.json(payload);
+  } catch (error) {
+    console.error('sitemap-tours error:', error.message);
+    res.status(500).json({ success: false, error: 'Failed to load sitemap tours' });
+  }
+});
+
+app.get('/api/tours/:tourId/reviews', async (req, res) => {
+  try {
+    const { tourId } = req.params;
+    const reviews = await prisma.review.findMany({
+      where: { tourId: parseInt(tourId) },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        customerName: true,
+        country: true,
+        rating: true,
+        guideRating: true,
+        valueRating: true,
+        text: true,
+        photos: true,
+        verified: true,
+        createdAt: true
+      }
+    });
+
+    let averageRating = 0;
+    let avgGuideRating = 0;
+    let avgValueRating = 0;
+    let guideCount = 0;
+    let valueCount = 0;
+
+    if (reviews.length > 0) {
+      averageRating = reviews.reduce((sum, r) => sum + r.rating, 0) / reviews.length;
+      reviews.forEach(r => {
+        if (r.guideRating) { avgGuideRating += r.guideRating; guideCount++; }
+        if (r.valueRating) { avgValueRating += r.valueRating; valueCount++; }
+      });
+      if (guideCount > 0) avgGuideRating /= guideCount;
+      if (valueCount > 0) avgValueRating /= valueCount;
+    }
+
+    res.json({
+      success: true,
+      reviews: reviews.map(r => ({
+        ...r,
+        photos: r.photos ? JSON.parse(r.photos) : []
+      })),
+      totalReviews: reviews.length,
+      averageRating: Math.round(averageRating * 10) / 10,
+      guideRating: Math.round(avgGuideRating * 10) / 10,
+      valueRating: Math.round(avgValueRating * 10) / 10
+    });
+  } catch (error) {
+    console.error('Error fetching reviews:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch reviews' });
+  }
+});
+
+// Verify review token and return booking info for the review page
+app.get('/api/reviews/verify/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+
+    const existingReview = await prisma.review.findUnique({
+      where: { reviewToken: token }
+    });
+
+    if (existingReview) {
+      return res.status(400).json({
+        success: false,
+        error: 'Review already submitted',
+        message: 'You have already submitted a review for this booking.'
+      });
+    }
+
+    const booking = await prisma.booking.findFirst({
+      where: {
+        reviewToken: token,
+        status: { in: ['confirmed', 'completed'] }
+      },
+      include: {
+        tour: {
+          select: { id: true, title: true, slug: true, city: true, country: true, images: true }
+        }
+      }
+    });
+
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        error: 'Invalid or expired review link',
+        message: 'This review link is invalid or has expired.'
+      });
+    }
+
+    if (booking.reviewTokenExpiresAt && new Date() > new Date(booking.reviewTokenExpiresAt)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Review link expired',
+        message: 'This review link has expired. Please contact support.'
+      });
+    }
+
+    let tourImage = null;
+    try {
+      const images = JSON.parse(booking.tour.images);
+      tourImage = Array.isArray(images) ? images[0] : null;
+    } catch (e) {}
+
+    res.json({
+      success: true,
+      booking: {
+        id: booking.id,
+        customerName: booking.customerName,
+        customerEmail: booking.customerEmail,
+        bookingDate: booking.bookingDate,
+        tourTitle: booking.tour.title,
+        tourSlug: booking.tour.slug,
+        tourCity: booking.tour.city,
+        tourCountry: booking.tour.country,
+        tourId: booking.tour.id,
+        tourImage
+      }
+    });
+  } catch (error) {
+    console.error('Error verifying review token:', error);
+    res.status(500).json({ success: false, error: 'Failed to verify review token' });
+  }
+});
+
+// Submit a guest review (text + optional photos, uploaded to R2)
+app.post('/api/reviews', async (req, res) => {
+  try {
+    const { token, rating, guideRating, valueRating, text, country, photos } = req.body;
+
+    if (!token || !rating || !text) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields',
+        message: 'Please provide a rating and review text.'
+      });
+    }
+
+    if (rating < 1 || rating > 5) {
+      return res.status(400).json({ success: false, error: 'Rating must be between 1 and 5' });
+    }
+
+    const existingReview = await prisma.review.findUnique({
+      where: { reviewToken: token }
+    });
+
+    if (existingReview) {
+      return res.status(400).json({
+        success: false,
+        error: 'Review already submitted',
+        message: 'You have already submitted a review for this booking.'
+      });
+    }
+
+    const booking = await prisma.booking.findFirst({
+      where: {
+        reviewToken: token,
+        status: { in: ['confirmed', 'completed'] }
+      },
+      include: {
+        tour: { select: { id: true, title: true } }
+      }
+    });
+
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        error: 'Invalid review link',
+        message: 'This review link is invalid or has expired.'
+      });
+    }
+
+    if (booking.reviewTokenExpiresAt && new Date() > new Date(booking.reviewTokenExpiresAt)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Review link expired',
+        message: 'This review link has expired.'
+      });
+    }
+
+    // Upload photos to R2 if provided
+    let photoUrls = [];
+    if (photos && Array.isArray(photos) && photos.length > 0) {
+      try {
+        photoUrls = await uploadMultipleImages(photos.slice(0, 5), `reviews/${booking.tourId}`);
+        console.log(`✅ Uploaded ${photoUrls.length} review photos`);
+      } catch (uploadError) {
+        console.error('❌ Failed to upload review photos:', uploadError);
+        // Don't fail the review submission if photo upload fails
+      }
+    }
+
+    const review = await prisma.review.create({
+      data: {
+        tourId: booking.tour.id,
+        bookingId: booking.id,
+        customerName: booking.customerName,
+        customerEmail: booking.customerEmail,
+        country: country || null,
+        rating: parseInt(rating),
+        guideRating: guideRating ? parseInt(guideRating) : null,
+        valueRating: valueRating ? parseInt(valueRating) : null,
+        text: text.trim(),
+        photos: photoUrls.length > 0 ? JSON.stringify(photoUrls) : null,
+        reviewToken: token,
+        tokenExpiresAt: booking.reviewTokenExpiresAt || new Date(Date.now() + 90 * 24 * 60 * 60 * 1000),
+        verified: true
+      }
+    });
+
+    console.log(`✅ Review submitted for tour "${booking.tour.title}" by ${booking.customerName}`);
+
+    res.json({
+      success: true,
+      message: 'Thank you for your review!',
+      review: {
+        id: review.id,
+        rating: review.rating,
+        tourTitle: booking.tour.title
+      }
+    });
+  } catch (error) {
+    console.error('Error submitting review:', error);
+    res.status(500).json({ success: false, error: 'Failed to submit review' });
+  }
+});
+
+// Manually send a review request email for a booking (admin tool)
+app.post('/api/bookings/:bookingId/send-review-link', async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+
+    const booking = await prisma.booking.findUnique({
+      where: { id: parseInt(bookingId) },
+      include: {
+        tour: { select: { id: true, title: true, slug: true, city: true, country: true } },
+        review: true
+      }
+    });
+
+    if (!booking) {
+      return res.status(404).json({ success: false, error: 'Booking not found' });
+    }
+
+    if (booking.status !== 'confirmed' && booking.status !== 'completed') {
+      return res.status(400).json({ success: false, error: 'Booking must be confirmed to request a review' });
+    }
+
+    if (booking.review) {
+      return res.status(400).json({ success: false, error: 'Review already submitted for this booking' });
+    }
+
+    let reviewToken = booking.reviewToken;
+    if (!reviewToken) {
+      reviewToken = randomBytes(32).toString('hex');
+      await prisma.booking.update({
+        where: { id: booking.id },
+        data: {
+          reviewToken,
+          reviewTokenExpiresAt: new Date(Date.now() + 90 * 24 * 60 * 60 * 1000)
+        }
+      });
+    }
+
+    const reviewUrl = `${process.env.FRONTEND_URL || 'https://www.globewithlocals.com'}/review/${reviewToken}`;
+
+    await sendReviewRequestEmail(
+      booking.customerEmail,
+      booking.customerName,
+      {
+        tourTitle: booking.tour.title,
+        tourCity: booking.tour.city,
+        tourCountry: booking.tour.country,
+        bookingDate: booking.bookingDate,
+        reviewUrl
+      }
+    );
+
+    console.log(`✅ Review request email sent to ${booking.customerEmail} for booking ${bookingId}`);
+
+    res.json({
+      success: true,
+      message: 'Review request email sent successfully',
+      reviewUrl
+    });
+  } catch (error) {
+    console.error('Error sending review link:', error);
+    res.status(500).json({ success: false, error: 'Failed to send review request' });
+  }
+});
+
+// Fire one test wake call, so the phone-ringing path can be proven the day it
+// is configured instead of the next time a payment fails at 3am.
+//
+// Unlike the other cron routes this ALWAYS requires the secret: an open
+// endpoint that places phone calls is a toll-fraud invitation, so with no
+// CRON_SECRET set it refuses rather than running unprotected.
+app.post('/api/cron/test-wake-call', async (req, res) => {
+  try {
+    if (!process.env.CRON_SECRET) {
+      return res.status(503).json({ success: false, error: 'CRON_SECRET not set — refusing to expose a call endpoint' });
+    }
+    if (req.headers['x-cron-secret'] !== process.env.CRON_SECRET) {
+      return res.status(401).json({ success: false, error: 'Unauthorized' });
+    }
+    if (!isWakeCallConfigured()) {
+      return res.json({ success: false, configured: false, error: 'No call provider configured (set OWNER_PHONE plus a provider)' });
+    }
+    const result = await wakeCall({
+      bookingId: 'TEST',
+      reason: 'This is a test alert from Globe With Locals',
+      amount: 0, currency: 'USD', tourTitle: 'a test booking',
+    });
+    res.json({ success: !!result.ok, ...result });
+  } catch (error) {
+    console.error('Test wake call failed:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Manual/cron trigger for the abandoned-checkout recovery sweep
+app.post('/api/cron/run-checkout-recovery', async (req, res) => {
+  try {
+    if (process.env.CRON_SECRET && req.headers['x-cron-secret'] !== process.env.CRON_SECRET) {
+      return res.status(401).json({ success: false, error: 'Unauthorized' });
+    }
+    const summary = await runCheckoutRecovery();
+    res.json({ success: true, ...summary });
+  } catch (error) {
+    console.error('Checkout recovery sweep failed:', error);
+    res.status(500).json({ success: false, error: 'Recovery sweep failed' });
+  }
+});
+
+// Manual/cron trigger for the review email sweep
+app.post('/api/cron/send-review-requests', async (req, res) => {
+  try {
+    if (process.env.CRON_SECRET && req.headers['x-cron-secret'] !== process.env.CRON_SECRET) {
+      return res.status(401).json({ success: false, error: 'Unauthorized' });
+    }
+    const summary = await sendDueReviewRequests();
+    res.json({ success: true, ...summary });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Agent API: AI agents search tours and open holds (see agent_api.js).
+mountAgentApi(app, prisma, { sendBookingAlert });
+mountMcp(app, { port: PORT });   // MCP endpoint for Claude/ChatGPT connectors (mcp_server.js)
+
+// Cron jobs, email schedulers, and checkout recovery — split out from the
+// listen() callback so a combined server (this Express app mounted inside
+// Next.js's custom-server, see web/server.mjs) can start them exactly once
+// itself instead of inheriting a second copy from this file's own listen().
+export function startBackgroundJobs() {
+  // Say out loud where alerts are going. A booking alert pointing at the wrong
+  // ntfy topic looks exactly like no bookings at all, and that silence cost us
+  // a $340 lead for 20 hours on 2026-08-31.
+  logAlertConfig();
+
+  // Start booking reminder cron jobs
+  startBookingCrons(prisma);
+
+  // Start guest review email scheduler (day-of-tour email + next-day reminder)
+  startReviewScheduler();
+
+  // Start abandoned/failed checkout recovery (guest-facing, not just an alert)
+  startCheckoutRecovery();
+
+  // A silent phone looks exactly like no bookings, so say which it is.
+  console.log(`☎️  Wake call: ${describeWakeCall()}`);
+}
+
+// Running `node server.js` directly (local dev, or a standalone deploy) still
+// binds its own port and starts the background jobs, unchanged from before.
+// Set EMBEDDED=true when this app is imported and mounted by another server
+// (web/server.mjs) so neither the port nor the cron jobs are bound twice.
+if (process.env.EMBEDDED !== 'true') {
+  app.listen(PORT, () => {
+    console.log(`🚀 Server running on http://localhost:${PORT}`);
+    console.log(`📊 API endpoints available at http://localhost:${PORT}/api`);
+    console.log(`🗄️  Database: PostgreSQL via Prisma ORM`);
+    const emailConfigured = process.env.RESEND_API_KEY || process.env.SENDGRID_API_KEY || process.env.EMAIL_USER;
+    console.log(`📧 Email: ${emailConfigured ? 'Configured' : 'Not configured - check .env'}`);
+    startBackgroundJobs();
+  });
+}
+
+export default app;

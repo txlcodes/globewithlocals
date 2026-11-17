@@ -1,0 +1,18 @@
+{
+  "schema_version": "v1",
+  "name_for_human": "GlobeWithLocals",
+  "name_for_model": "globewithlocals",
+  "description_for_human": "Book tours run by local operators.",
+  "description_for_model": "Search tours by city and keywords or date, get a price for the party size, and open a 24-hour booking hold that the traveller completes by paying on the returned payment_url. Every tour is run by a local operator we contact directly; we confirm the date with the operator and refund in full if they cannot take it. Prices include our margin; do not describe us as the cheapest. Requires an X-Agent-Key header; keys are issued to named agents via info@globewithlocals.com.",
+  "auth": {
+    "type": "service_http",
+    "authorization_type": "bearer",
+    "instructions": "Send the agent key as X-Agent-Key (or Authorization: Bearer). Request one from info@globewithlocals.com."
+  },
+  "api": {
+    "type": "openapi",
+    "url": "https://globewithlocals.com/api/agent/openapi.json"
+  },
+  "contact_email": "info@globewithlocals.com",
+  "legal_info_url": "https://globewithlocals.com/terms-and-conditions"
+}

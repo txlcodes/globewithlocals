@@ -1,0 +1,338 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Supplier {
+  id                       Int       @id @default(autoincrement())
+  businessType             String    @map("business_type")
+  companyEmployees         String?   @map("company_employees")
+  companyActivities        String?   @map("company_activities")
+  individualActivities     String?   @map("individual_activities")
+  otherActivities          String?   @map("other_activities")
+  fullName                 String    @map("full_name")
+  email                    String    @unique
+  passwordHash             String    @map("password_hash")
+  companyName              String?   @map("company_name")
+  mainHub                  String?   @map("main_hub")
+  city                     String?
+  tourLanguages            String?   @map("tour_languages")
+  phone                    String? // Guide's phone number
+  whatsapp                 String? // Guide's WhatsApp number
+  verificationDocumentUrl  String?   @map("verification_document_url")
+  certificates             String?   @map("certificates") // JSON array of certificate URLs (4-5 certificates)
+  emailVerified            Boolean   @default(false) @map("email_verified")
+  emailVerificationToken   String?   @map("email_verification_token")
+  emailVerificationExpires DateTime? @map("email_verification_expires")
+  status                   String    @default("pending")
+  createdAt                DateTime  @default(now()) @map("created_at")
+  updatedAt                DateTime  @updatedAt @map("updated_at")
+
+  // Payment Details
+  paymentMethod        String? @map("payment_method") // "bank_transfer", "paypal", "credit_card", "upi"
+  paymentMethodDetails String? @map("payment_method_details") // JSON string with method-specific details
+  paymentCurrency      String? @map("payment_currency") // Currency for payouts (INR, USD, etc.)
+  paymentFrequency     String  @default("monthly") @map("payment_frequency") // "monthly", "biweekly"
+
+  // Tax Details (Optional)
+  taxId       String? @map("tax_id") // GSTIN, PAN, VAT number, etc.
+  taxIdType   String? @map("tax_id_type") // "GSTIN", "PAN", "VAT", "EIN", etc.
+  taxCountry  String? @map("tax_country") // Country of tax registration
+  taxVerified Boolean @default(false) @map("tax_verified")
+
+  // Payment Status
+  paymentDetailsVerified   Boolean   @default(false) @map("payment_details_verified")
+  paymentDetailsVerifiedAt DateTime? @map("payment_details_verified_at")
+
+  tours    Tour[]
+  bookings Booking[]
+
+  @@index([email])
+  @@index([emailVerificationToken])
+  @@map("suppliers")
+}
+
+model Tour {
+  id                    Int          @id @default(autoincrement())
+  supplierId            Int          @map("supplier_id")
+  parentTourId          Int?         @map("parent_tour_id") // For mini tours linked to parent tours
+  title                 String
+  slug                  String       @unique
+  country               String
+  city                  String
+  category              String
+  locations             String
+  duration              String
+  pricePerPerson        Float        @map("price_per_person") // Legacy field - use tour_options for pricing
+  currency              String       @default("INR")
+  shortDescription      String?      @map("short_description")
+  fullDescription       String       @map("full_description")
+  highlights            String?      @map("highlights")
+  included              String
+  notIncluded           String?      @map("not_included")
+  meetingPoint          String?      @map("meeting_point")
+  guideType             String?      @map("guide_type")
+  tourTypes             String?      @map("tour_types") // JSON array of tour types/tags
+  images                String
+  languages             String
+  reviews               String? // JSON array of fake reviews
+  status                String       @default("draft")
+  rejectionReason       String?      @map("rejection_reason")
+  maxGroupSize          Int?         @map("max_group_size") // Maximum number of people guide can handle
+  groupPrice            Float?       @map("group_price") // Single price for max group size
+  groupPricingTiers     String?      @map("group_pricing_tiers") // JSON array of {minPeople, maxPeople, price} objects for tiered group pricing
+  unavailableDates      String?      @map("unavailable_dates") // Legacy - JSON array of dates guide is not available (ISO date strings)
+  unavailableDaysOfWeek String?      @map("unavailable_days_of_week") // JSON array of days of week guide is not available (0=Sunday, 1=Monday, ..., 6=Saturday)
+  createdAt             DateTime     @default(now()) @map("created_at")
+  updatedAt             DateTime     @updatedAt @map("updated_at")
+  approvedAt            DateTime?    @map("approved_at")
+  itineraryItems        String?      @map("itinerary_items") // JSON array of {title, time, duration, description, type, optional}
+  detailedItinerary     String?      @map("detailed_itinerary") // Long-form text itinerary (300+ words)
+  pickupIncluded        Boolean      @default(false) @map("pickup_included")
+  visitorInfo           String?      @map("visitor_info")
+  checklistItems        String?      @map("checklist_items") // JSON array of {label, value, iconType}
+  // The operator who actually runs the tour, shown to travellers. The column has
+  // existed in the database all along but was missing from this model, so every
+  // import silently dropped it and every tour launched with a blank provider.
+  activityProvider      String?      @map("activity_provider")
+  // Source listing this tour was built from. Without it a tour cannot be
+  // checked against the operator's own public rate, which is how 108 tours
+  // ended up quoting up to 5x the correct price before 2026-09-10.
+  externalActivityId         String?      @map("external_activity_id")
+  // Review summary for list cards and popularity ordering, written together with the
+  // tours.reviews blob by /api/admin/tours/reviews-bulk (cards never read the blob).
+  reviewAvg             Float?       @map("review_avg")
+  reviewCount           Int?         @map("review_count")
+  supplier              Supplier     @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  parentTour            Tour?        @relation("TourMiniTours", fields: [parentTourId], references: [id], onDelete: SetNull)
+  miniTours             Tour[]       @relation("TourMiniTours")
+  bookings              Booking[]
+  options               TourOption[]
+  reviewsList           Review[]
+
+  @@index([supplierId])
+  @@index([status])
+  @@index([city])
+  @@index([parentTourId])
+  @@map("tours")
+}
+
+model TourOption {
+  id                  Int       @id @default(autoincrement())
+  tourId              Int       @map("tour_id")
+  tour                Tour      @relation(fields: [tourId], references: [id], onDelete: Cascade)
+  optionTitle         String    @map("option_title")
+  optionDescription   String    @map("option_description")
+  durationHours       Float     @map("duration_hours")
+  price               Float
+  currency            String    @default("INR")
+  language            String    @default("English")
+  pickupIncluded      Boolean   @default(false) @map("pickup_included")
+  entryTicketIncluded Boolean   @default(false) @map("entry_ticket_included")
+  guideIncluded       Boolean   @default(true) @map("guide_included")
+  carIncluded         Boolean   @default(false) @map("car_included")
+  groupPricingTiers   String?   @map("group_pricing_tiers") // JSON array of {minPeople, maxPeople, price} objects for tiered group pricing
+  // TEMPORARILY COMMENTED OUT - These columns don't exist in production DB yet
+  // Uncomment after running migration: npx prisma migrate deploy
+  // maxGroupSize        Int?      @map("max_group_size") // Max people per group (1-20). If set with groupPrice, indicates per-group pricing
+  // groupPrice          Float?    @map("group_price") // Price for entire group. If set with maxGroupSize, indicates per-group pricing
+  images              String?   @map("images") // JSON array of image URLs for this specific option (e.g. boat photos)
+  sortOrder           Int       @default(0) @map("sort_order")
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
+  bookings            Booking[]
+
+  @@index([tourId])
+  @@map("tour_options")
+}
+
+model Booking {
+  id                Int         @id @default(autoincrement())
+  tourId            Int         @map("tour_id")
+  tour              Tour        @relation(fields: [tourId], references: [id], onDelete: Cascade)
+  tourOptionId      Int?        @map("tour_option_id") // Optional - for option-based bookings
+  tourOption        TourOption? @relation(fields: [tourOptionId], references: [id], onDelete: SetNull)
+  supplierId        Int         @map("supplier_id")
+  supplier          Supplier    @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  customerName      String      @map("customer_name")
+  customerEmail     String      @map("customer_email")
+  customerPhone     String?     @map("customer_phone")
+  bookingDate       String      @map("booking_date") // Store as ISO string
+  numberOfGuests    Int         @map("number_of_guests")
+  totalAmount       Float       @map("total_amount")
+  currency          String      @default("INR")
+  specialRequests   String?     @map("special_requests")
+  status            String      @default("pending_payment") // pending_payment, payment_failed, confirmed, cancelled, completed
+  paymentStatus     String      @default("pending") @map("payment_status") // pending, paid, failed, refunded
+  razorpayOrderId   String?     @map("razorpay_order_id")
+  razorpayPaymentId String?     @map("razorpay_payment_id")
+  razorpaySignature String?     @map("razorpay_signature")
+  confirmedAt       DateTime?   @map("confirmed_at")
+  invoiceUrl        String?     @map("invoice_url")
+  createdAt         DateTime    @default(now()) @map("created_at")
+  updatedAt         DateTime    @updatedAt @map("updated_at")
+
+  // Guide confirmation workflow
+  guideConfirmationToken String?   @unique @map("guide_confirmation_token")
+  guideConfirmedAt       DateTime? @map("guide_confirmed_at")
+  guideReminderCount     Int       @default(0) @map("guide_reminder_count")
+  guideLastRemindedAt    DateTime? @map("guide_last_reminded_at")
+  adminEscalatedAt       DateTime? @map("admin_escalated_at")
+  preTourReminderSentAt  DateTime? @map("pre_tour_reminder_sent_at")
+
+  // Guest review workflow (day-of-tour email + next-day reminder)
+  reviewToken          String?   @unique @map("review_token")
+  reviewTokenExpiresAt DateTime? @map("review_token_expires_at")
+  reviewRequestSentAt  DateTime? @map("review_request_sent_at")
+  reviewReminderSentAt DateTime? @map("review_reminder_sent_at")
+
+  // Abandoned-checkout recovery ladder. Every step is stamped so a sweep that
+  // runs twice, or a restart mid-sweep, can never message the same guest twice.
+  recoveryToken          String?   @unique @map("recovery_token")
+  recoveryNudge1SentAt   DateTime? @map("recovery_nudge1_sent_at")
+  recoveryNudge2SentAt   DateTime? @map("recovery_nudge2_sent_at")
+  recoveryWhatsappSentAt DateTime? @map("recovery_whatsapp_sent_at")
+  recoveryEscalatedAt    DateTime? @map("recovery_escalated_at")
+  recoveredAt            DateTime? @map("recovered_at")
+  // Admin "checkout abandoned" alert, stamped in the database rather than a
+  // process-local Set: Render restarts on every deploy, which emptied the Set
+  // and re-alerted the same guest all day on 2026-09-07.
+  abandonedAlertedAt     DateTime? @map("abandoned_alerted_at")
+
+  messages Message[]
+  review   Review?
+
+  @@index([tourId])
+  @@index([tourOptionId])
+  @@index([supplierId])
+  @@index([customerEmail])
+  @@index([status, guideConfirmedAt])
+  @@map("bookings")
+}
+
+model Review {
+  id             Int      @id @default(autoincrement())
+  tourId         Int      @map("tour_id")
+  tour           Tour     @relation(fields: [tourId], references: [id], onDelete: Cascade)
+  bookingId      Int      @unique @map("booking_id")
+  booking        Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  customerName   String   @map("customer_name")
+  customerEmail  String   @map("customer_email")
+  country        String?
+  rating         Int // 1-5
+  guideRating    Int?     @map("guide_rating") // 1-5
+  valueRating    Int?     @map("value_rating") // 1-5
+  text           String
+  photos         String? // JSON array of image URLs
+  reviewToken    String   @unique @map("review_token")
+  tokenExpiresAt DateTime @map("token_expires_at")
+  verified       Boolean  @default(true) // Always true since link is sent to booking email
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  @@index([tourId])
+  @@index([bookingId])
+  @@index([reviewToken])
+  @@map("reviews_table")
+}
+
+model Message {
+  id          Int      @id @default(autoincrement())
+  bookingId   Int      @map("booking_id")
+  booking     Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  senderType  String   @map("sender_type") // 'customer' or 'supplier'
+  senderEmail String   @map("sender_email") // Customer email or supplier email
+  message     String
+  read        Boolean  @default(false)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@index([bookingId])
+  @@index([senderEmail])
+  @@map("messages")
+}
+
+model Tourist {
+  id           Int      @id @default(autoincrement())
+  name         String
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  @@index([email])
+  @@map("tourists")
+}
+
+model EmailSubscription {
+  id                Int       @id @default(autoincrement())
+  email             String
+  city              String? // City name (e.g., "Agra", "Delhi", "Jaipur")
+  country           String? // Country name (e.g., "India")
+  subscriptionType  String    @default("itinerary") // "itinerary" or "newsletter"
+  verified          Boolean   @default(false)
+  verificationToken String?   @map("verification_token")
+  verifiedAt        DateTime? @map("verified_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  @@unique([email, city, subscriptionType])
+  @@index([email])
+  @@index([city])
+  @@map("email_subscriptions")
+}
+
+// ---- Agent API (2026-09): AI agents search tours and open holds ----
+// Keys are issued by hand; every request is counted here so quotas survive a
+// Render restart (a process-local counter would reset on each deploy).
+model AgentKey {
+  id          Int       @id @default(autoincrement())
+  key         String    @unique
+  name        String                              // who holds it (agent / company)
+  contact     String?                             // email of the key holder
+  dailyQuota  Int       @default(300) @map("daily_quota")
+  holdQuota   Int       @default(20)  @map("hold_quota")
+  active      Boolean   @default(true)
+  createdAt   DateTime  @default(now()) @map("created_at")
+  lastUsedAt  DateTime? @map("last_used_at")
+  requests    AgentRequest[]
+  holds       AgentHold[]
+
+  @@map("agent_keys")
+}
+
+model AgentRequest {
+  id        Int      @id @default(autoincrement())
+  keyId     Int      @map("key_id")
+  key       AgentKey @relation(fields: [keyId], references: [id], onDelete: Cascade)
+  kind      String                                // search | tour | hold
+  day       String                                // YYYY-MM-DD in UTC, for the daily count
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([keyId, day, kind])
+  @@map("agent_requests")
+}
+
+// A hold is a pending booking opened by an agent on a traveller's behalf. It
+// points at the normal Booking row (status pending_payment); the traveller
+// pays on /booking/<id> and only then does the operator hear about it.
+model AgentHold {
+  id         Int       @id @default(autoincrement())
+  holdId     String    @unique @map("hold_id")     // opaque id returned to the agent
+  keyId      Int       @map("key_id")
+  key        AgentKey  @relation(fields: [keyId], references: [id], onDelete: Cascade)
+  bookingId  Int       @map("booking_id")
+  tourId     Int       @map("tour_id")
+  pax        Int
+  date       String                                // YYYY-MM-DD
+  amountUsd  Float     @map("amount_usd")
+  expiresAt  DateTime  @map("expires_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  @@index([keyId])
+  @@map("agent_holds")
+}
