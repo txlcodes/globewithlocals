@@ -11,8 +11,8 @@
   },
   "api": {
     "type": "openapi",
-    "url": "https://globewithlocals.com/api/agent/openapi.json"
+    "url": "https://www.globewithlocals.com/api/agent/openapi.json"
   },
   "contact_email": "info@globewithlocals.com",
-  "legal_info_url": "https://globewithlocals.com/terms-and-conditions"
+  "legal_info_url": "https://www.globewithlocals.com/terms-and-conditions"
 }

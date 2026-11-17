@@ -83,13 +83,13 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
     title,
     description,
     alternates: {
-      canonical: `https://globewithlocals.com/${country.toLowerCase()}/${city.toLowerCase()}`,
+      canonical: `https://www.globewithlocals.com/${country.toLowerCase()}/${city.toLowerCase()}`,
     },
     ...(noIndex ? { robots: { index: false, follow: true } } : {}),
     openGraph: {
       title,
       description,
-      url: `https://globewithlocals.com/${country.toLowerCase()}/${city.toLowerCase()}`,
+      url: `https://www.globewithlocals.com/${country.toLowerCase()}/${city.toLowerCase()}`,
       siteName: 'GlobeWithLocals',
       type: 'website',
     },
@@ -197,11 +197,11 @@ export default async function CityPage({ params }: Props) {
   // ---------- SERVER-SIDE JSON-LD (guaranteed in raw HTML for SEO/AEO/GEO) ----------
   const citySlug = city.toLowerCase();
   const countrySlug = country.toLowerCase();
-  const cityPageUrl = `https://globewithlocals.com/${countrySlug}/${citySlug}`;
+  const cityPageUrl = `https://www.globewithlocals.com/${countrySlug}/${citySlug}`;
   const metaInfo = CITY_META[cityName];
   const cityTitle = metaInfo?.title || `${cityName} Tours & Things to Do | Guided Experiences by Locals`;
   const cityDescription = metaInfo?.description || `Discover the best tours in ${cityName} with licensed local guides. Book authentic experiences in ${cityName}, ${countryName}.`;
-  const cityOgImage = tours.find(t => t.images?.[0])?.images?.[0] || 'https://globewithlocals.com/favicon-96x96-v7.png';
+  const cityOgImage = tours.find(t => t.images?.[0])?.images?.[0] || 'https://www.globewithlocals.com/favicon-96x96-v7.png';
   const todayISO = new Date().toISOString().split('T')[0];
 
   const jsonLd = {
@@ -215,8 +215,8 @@ export default async function CityPage({ params }: Props) {
         inLanguage: 'en',
         datePublished: '2025-01-01',
         dateModified: todayISO,
-        isPartOf: { '@type': 'WebSite', name: 'GlobeWithLocals', url: 'https://globewithlocals.com' },
-        publisher: { '@type': 'Organization', name: 'GlobeWithLocals', url: 'https://globewithlocals.com' },
+        isPartOf: { '@type': 'WebSite', name: 'GlobeWithLocals', url: 'https://www.globewithlocals.com' },
+        publisher: { '@type': 'Organization', name: 'GlobeWithLocals', url: 'https://www.globewithlocals.com' },
         speakable: { '@type': 'SpeakableSpecification', cssSelector: ['h1', '.space-y-4.text-gray-700', 'h2', 'h3'] },
         about: { '@type': 'City', name: cityName, containedIn: { '@type': 'Country', name: countryName } },
       },
@@ -232,7 +232,7 @@ export default async function CityPage({ params }: Props) {
       {
         '@type': 'TourOperator',
         name: 'GlobeWithLocals',
-        url: 'https://globewithlocals.com',
+        url: 'https://www.globewithlocals.com',
         description: `Discover expert-led tours in ${cityName} with licensed local guides. Book authentic, small-group experiences with GlobeWithLocals.`,
         areaServed: { '@type': 'City', name: cityName, containedIn: { '@type': 'Country', name: countryName } },
         hasOfferCatalog: {
@@ -281,8 +281,8 @@ export default async function CityPage({ params }: Props) {
       {
         '@type': 'BreadcrumbList',
         itemListElement: [
-          { '@type': 'ListItem', position: 1, name: 'Home', item: 'https://globewithlocals.com' },
-          { '@type': 'ListItem', position: 2, name: countryName, item: `https://globewithlocals.com/${countrySlug}` },
+          { '@type': 'ListItem', position: 1, name: 'Home', item: 'https://www.globewithlocals.com' },
+          { '@type': 'ListItem', position: 2, name: countryName, item: `https://www.globewithlocals.com/${countrySlug}` },
           { '@type': 'ListItem', position: 3, name: cityName, item: cityPageUrl },
         ],
       },

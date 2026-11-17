@@ -13,7 +13,7 @@ const plusJakartaSans = Plus_Jakarta_Sans({
 })
 
 export const metadata: Metadata = {
-  metadataBase: new URL('https://globewithlocals.com'),
+  metadataBase: new URL('https://www.globewithlocals.com'),
   title: 'GlobeWithLocals - Local Tours & Experiences',
   description:
     'Discover local tours and experiences with local guides.',
@@ -32,7 +32,7 @@ export const metadata: Metadata = {
   },
   openGraph: {
     type: 'website',
-    url: 'https://globewithlocals.com/',
+    url: 'https://www.globewithlocals.com/',
     title: 'GlobeWithLocals - Local Tours & Experiences',
     description:
       'Discover local tours and experiences with local guides.',
@@ -58,10 +58,10 @@ export const viewport: Viewport = {
 const jsonLd = {
   '@context': 'https://schema.org',
   '@type': ['Organization', 'TravelAgency'],
-  '@id': 'https://globewithlocals.com/#organization',
+  '@id': 'https://www.globewithlocals.com/#organization',
   name: 'GlobeWithLocals',
   description: 'Local tours and experiences with local guides.',
-  url: 'https://globewithlocals.com',
+  url: 'https://www.globewithlocals.com',
   email: 'info@globewithlocals.com',
   telephone: '+971521813249',
   taxID: '09BPLPK5079QIZU',

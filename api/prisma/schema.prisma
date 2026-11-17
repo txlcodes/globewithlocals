@@ -105,6 +105,7 @@ model Tour {
   externalActivityId         String?      @map("external_activity_id")
   // Review summary for list cards and popularity ordering, written together with the
   // tours.reviews blob by /api/admin/tours/reviews-bulk (cards never read the blob).
+  faqs                  String?      // JSON array of {question, answer}
   reviewAvg             Float?       @map("review_avg")
   reviewCount           Int?         @map("review_count")
   supplier              Supplier     @relation(fields: [supplierId], references: [id], onDelete: Cascade)

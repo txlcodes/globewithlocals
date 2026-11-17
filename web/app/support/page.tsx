@@ -4,7 +4,7 @@ import SupportClient from '@/components/SupportClient';
 export const metadata: Metadata = {
   title: 'Support | GlobeWithLocals',
   description: 'Get help and support for your GlobeWithLocals bookings and tours.',
-  alternates: { canonical: 'https://globewithlocals.com/support' },
+  alternates: { canonical: 'https://www.globewithlocals.com/support' },
 };
 
 export default function SupportPage() {

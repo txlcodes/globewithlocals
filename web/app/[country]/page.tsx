@@ -222,12 +222,12 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
     title: meta.title,
     description: meta.description,
     alternates: {
-      canonical: `https://globewithlocals.com/${c}`,
+      canonical: `https://www.globewithlocals.com/${c}`,
     },
     openGraph: {
       title: meta.title,
       description: meta.description,
-      url: `https://globewithlocals.com/${c}`,
+      url: `https://www.globewithlocals.com/${c}`,
       siteName: 'GlobeWithLocals',
       type: 'website',
       
@@ -308,14 +308,14 @@ export default async function CountryPage({ params }: Props) {
         '@type': 'CollectionPage',
         name: `Tours in ${countryName}`,
         description: `Discover the best tours across ${countryName} with licensed local guides.`,
-        url: `https://globewithlocals.com/${c}`,
-        isPartOf: { '@type': 'WebSite', name: 'GlobeWithLocals', url: 'https://globewithlocals.com' },
+        url: `https://www.globewithlocals.com/${c}`,
+        isPartOf: { '@type': 'WebSite', name: 'GlobeWithLocals', url: 'https://www.globewithlocals.com' },
       },
       {
         '@type': 'TravelAgency',
         name: 'GlobeWithLocals',
         description: `Book verified local guides and private tours across ${countryName}. Authentic cultural experiences, heritage walks, food tours & day trips.`,
-        url: 'https://globewithlocals.com',
+        url: 'https://www.globewithlocals.com',
         areaServed: { '@type': 'Country', name: countryName },
       },
       ...(faqs.length > 0 ? [{
@@ -325,8 +325,8 @@ export default async function CountryPage({ params }: Props) {
       {
         '@type': 'BreadcrumbList',
         itemListElement: [
-          { '@type': 'ListItem', position: 1, name: 'Home', item: 'https://globewithlocals.com' },
-          { '@type': 'ListItem', position: 2, name: countryName, item: `https://globewithlocals.com/${c}` },
+          { '@type': 'ListItem', position: 1, name: 'Home', item: 'https://www.globewithlocals.com' },
+          { '@type': 'ListItem', position: 2, name: countryName, item: `https://www.globewithlocals.com/${c}` },
         ],
       },
     ],

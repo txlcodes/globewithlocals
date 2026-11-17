@@ -3,7 +3,7 @@ import { CITY_URL_MAP, VALID_COUNTRIES } from '@/lib/cityCountryMap';
 import { EUROPE_GUIDES } from '@/lib/guides';
 import { ITINERARY_COUNTRIES, getItinerarySlugs } from '@/lib/itineraries';
 
-const BASE_URL = 'https://globewithlocals.com';
+const BASE_URL = 'https://www.globewithlocals.com';
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:3001';
 
 // One sitemap file may hold 50,000 URLs and 50 MB. We split well below that so a

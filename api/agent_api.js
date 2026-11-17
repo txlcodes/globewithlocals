@@ -121,7 +121,7 @@ export default function mountAgentApi(app, prisma, deps = {}) {
     res.json({
       name: 'GlobeWithLocals Agent API',
       description: 'Search tours run by verified local operators across India, Japan, Thailand, Sri Lanka, Vietnam, Indonesia (Bali), the UAE and Nepal, and open a booking hold that a traveller completes by paying.',
-      openapi: 'https://globewithlocals.com/api/agent/openapi.json',
+      openapi: 'https://www.globewithlocals.com/api/agent/openapi.json',
       auth: 'Send your key in the X-Agent-Key header. Keys are issued to named agents: email info@globewithlocals.com with the agent or product name.',
       limits: { searches_per_day: 300, holds_per_day: 20, burst_per_minute: BURST_PER_MIN, max_results: MAX_LIMIT },
       honesty: 'Prices include our margin; we are not the cheapest listing. What you get is a local operator we message directly, a WhatsApp-confirmed booking, and a full refund if the operator cannot take the date.',
@@ -132,7 +132,7 @@ export default function mountAgentApi(app, prisma, deps = {}) {
     res.json({
       openapi: '3.0.3',
       info: { title: 'GlobeWithLocals Agent API', version: '1.0.0', description: 'Search local-operator tours in Europe and open booking holds for a traveller.' },
-      servers: [{ url: 'https://globewithlocals.com' }],
+      servers: [{ url: 'https://www.globewithlocals.com' }],
       components: { securitySchemes: { agentKey: { type: 'apiKey', in: 'header', name: 'X-Agent-Key' } } },
       security: [{ agentKey: [] }],
       paths: {

@@ -25,11 +25,11 @@ services:
           name: gwl-db
           property: connectionString
       - key: FRONTEND_URL
-        value: https://globewithlocals.com
+        value: https://www.globewithlocals.com
       - key: NEXT_PUBLIC_FRONTEND_URL
-        value: https://globewithlocals.com
+        value: https://www.globewithlocals.com
       - key: NEXT_PUBLIC_API_URL
-        value: https://globewithlocals.com
+        value: https://www.globewithlocals.com
       - key: SITEMAP_CITIES
         value: ""
       - key: R2_BUCKET

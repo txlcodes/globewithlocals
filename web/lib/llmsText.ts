@@ -1,7 +1,7 @@
 import { EUROPE_GUIDES } from '@/lib/guides';
 import { ITINERARY_COUNTRIES, getItinerarySlugs } from '@/lib/itineraries';
 
-const H = 'https://globewithlocals.com';
+const H = 'https://www.globewithlocals.com';
 const COUNTRIES: Record<string, string[]> = {
   italy: ['rome', 'florence', 'venice', 'milan'],
   spain: ['madrid', 'barcelona', 'seville', 'valencia', 'granada'],

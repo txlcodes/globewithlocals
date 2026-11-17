@@ -25,7 +25,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const data = getItinerary(country, slug);
   if (!data) return { title: 'Itinerary Not Found | GlobeWithLocals' };
 
-  const url = `https://globewithlocals.com/${country.toLowerCase()}/itineraries/${slug}`;
+  const url = `https://www.globewithlocals.com/${country.toLowerCase()}/itineraries/${slug}`;
   return {
     title: data.metaTitle,
     description: data.metaDescription,
@@ -98,7 +98,7 @@ export default async function ItineraryPage({ params }: Props) {
         provider: {
           '@type': 'Organization',
           name: 'GlobeWithLocals',
-          url: 'https://globewithlocals.com',
+          url: 'https://www.globewithlocals.com',
         },
       },
       {

@@ -21,7 +21,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   return {
     title: `${label} Itineraries: 3 to 10 Days, Planned Properly | GlobeWithLocals`,
     description: `Honest ${label} itineraries for 3, 5, 7 and 10 days — real train times, what fits and what does not, and the tours worth booking on each day.`,
-    alternates: { canonical: `https://globewithlocals.com/${country.toLowerCase()}/itineraries` },
+    alternates: { canonical: `https://www.globewithlocals.com/${country.toLowerCase()}/itineraries` },
   };
 }
 

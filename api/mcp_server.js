@@ -84,7 +84,7 @@ export default function mountMcp(app, { port }) {
   app.get('/mcp', (_req, res) => res.json({
     name: 'GlobeWithLocals MCP',
     transport: 'streamable-http',
-    endpoint: 'POST https://globewithlocals.com/mcp/<your agent key>',
+    endpoint: 'POST https://www.globewithlocals.com/mcp/<your agent key>',
     tools: ['search_tours', 'get_tour', 'request_booking', 'hold_status'],
     keys: 'Issued to named agents: info@globewithlocals.com',
   }));

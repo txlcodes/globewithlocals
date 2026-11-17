@@ -8,7 +8,7 @@ import { countryDisplayName } from '@/lib/countryName';
 export const metadata: Metadata = {
   title: 'Explore Every Destination and Guide | GlobeWithLocals',
   description: 'Every country, city and travel guide on GlobeWithLocals on one page: tours by verified local operators across India, Japan, Thailand, Sri Lanka, Vietnam, Indonesia, the UAE and Nepal.',
-  alternates: { canonical: 'https://globewithlocals.com/explore' },
+  alternates: { canonical: 'https://www.globewithlocals.com/explore' },
 };
 
 // An HTML index of the whole site, linked from the footer, so every city and

@@ -90,7 +90,7 @@ const allowedOrigins = [
   process.env.FRONTEND_URL,
   process.env.VITE_FRONTEND_URL,
   'https://www.globewithlocals.com',
-  'https://globewithlocals.com',
+  'https://www.globewithlocals.com',
   // Add www variant if main domain is set
   process.env.FRONTEND_URL?.replace('https://', 'https://www.'),
   process.env.VITE_FRONTEND_URL?.replace('https://', 'https://www.')

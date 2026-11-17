@@ -3,7 +3,6 @@ import { notFound, permanentRedirect } from 'next/navigation';
 import { CITY_URL_MAP } from '@/lib/cityCountryMap';
 import { getCityInfoContent } from '@/lib/cityInfoContent';
 import { EUROPE_GUIDES } from '@/lib/guides';
-import { getTourSpecificFAQs } from '@/lib/tourFaqs';
 import { getTourReviews } from '@/lib/tourReviews';
 import Link from 'next/link';
 import TourDetailClient from '@/components/TourDetailClient';
@@ -107,12 +106,12 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
       title: `${metaTitle} | GlobeWithLocals`,
       description,
       alternates: {
-        canonical: `https://globewithlocals.com/${country.toLowerCase()}/${city.toLowerCase()}/${slug}`,
+        canonical: `https://www.globewithlocals.com/${country.toLowerCase()}/${city.toLowerCase()}/${slug}`,
       },
       openGraph: {
         title: `${metaTitle} | GlobeWithLocals`,
         description,
-        url: `https://globewithlocals.com/${country.toLowerCase()}/${city.toLowerCase()}/${slug}`,
+        url: `https://www.globewithlocals.com/${country.toLowerCase()}/${city.toLowerCase()}/${slug}`,
         siteName: 'GlobeWithLocals',
         type: 'article',
         // Social cards never need the untouched 0.73 MB original, and Next
@@ -156,7 +155,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
           title: titleTag,
           description,
           alternates: {
-            canonical: `https://globewithlocals.com/${canonicalCountry}/${city.toLowerCase()}/${canonicalSlug}`,
+            canonical: `https://www.globewithlocals.com/${canonicalCountry}/${city.toLowerCase()}/${canonicalSlug}`,
           },
           openGraph: {
             title: titleTag,
@@ -174,7 +173,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
     title: `${cityName} Tour | GlobeWithLocals`,
     description: `Book tours in ${cityName} with licensed local guides.`,
     alternates: {
-      canonical: `https://globewithlocals.com/${country.toLowerCase()}/${city.toLowerCase()}/${DUPLICATE_CANONICAL_MAP[slug] || slug}`,
+      canonical: `https://www.globewithlocals.com/${country.toLowerCase()}/${city.toLowerCase()}/${DUPLICATE_CANONICAL_MAP[slug] || slug}`,
     },
   };
 }
@@ -204,8 +203,8 @@ export default async function SlugPage({ params }: Props) {
                 description: infoContent.description,
                 image: infoContent.heroImage,
                 author: { '@type': 'Organization', name: 'GlobeWithLocals' },
-                publisher: { '@type': 'Organization', name: 'GlobeWithLocals', url: 'https://globewithlocals.com' },
-                mainEntityOfPage: `https://globewithlocals.com/${countrySlug}/${citySlug}/${slug}`,
+                publisher: { '@type': 'Organization', name: 'GlobeWithLocals', url: 'https://www.globewithlocals.com' },
+                mainEntityOfPage: `https://www.globewithlocals.com/${countrySlug}/${citySlug}/${slug}`,
               },
               ...(infoContent.faqs && infoContent.faqs.length > 0
                 ? [{
@@ -237,10 +236,10 @@ export default async function SlugPage({ params }: Props) {
             '@context': 'https://schema.org',
             '@type': 'BreadcrumbList',
             itemListElement: [
-              { '@type': 'ListItem', position: 1, name: 'Home', item: 'https://globewithlocals.com' },
-              { '@type': 'ListItem', position: 2, name: countryName, item: `https://globewithlocals.com/${countrySlug}` },
-              { '@type': 'ListItem', position: 3, name: cityName, item: `https://globewithlocals.com/${countrySlug}/${citySlug}` },
-              { '@type': 'ListItem', position: 4, name: infoContent?.title || slug, item: `https://globewithlocals.com/${countrySlug}/${citySlug}/${slug}` },
+              { '@type': 'ListItem', position: 1, name: 'Home', item: 'https://www.globewithlocals.com' },
+              { '@type': 'ListItem', position: 2, name: countryName, item: `https://www.globewithlocals.com/${countrySlug}` },
+              { '@type': 'ListItem', position: 3, name: cityName, item: `https://www.globewithlocals.com/${countrySlug}/${citySlug}` },
+              { '@type': 'ListItem', position: 4, name: infoContent?.title || slug, item: `https://www.globewithlocals.com/${countrySlug}/${citySlug}/${slug}` },
             ],
           }) }}
         />
@@ -297,7 +296,7 @@ export default async function SlugPage({ params }: Props) {
   }
 
   // ---------- SERVER-SIDE JSON-LD for Tour Detail (guaranteed in raw HTML) ----------
-  const tourUrl = `https://globewithlocals.com/${countrySlug}/${citySlug}/${slug}`;
+  const tourUrl = `https://www.globewithlocals.com/${countrySlug}/${citySlug}/${slug}`;
   const todayISO = new Date().toISOString().split('T')[0];
 
   // Build real itinerary from tour data
@@ -324,7 +323,14 @@ export default async function SlugPage({ params }: Props) {
       };
 
   // Get FAQs for this tour (from extracted lib/tourFaqs.ts)
-  const tourFaqs = getTourSpecificFAQs(tour?.title || '', slug);
+  let tourFaqs: { question: string; answer: string }[] = [];
+  try {
+    const raw = (tour as any)?.faqs;
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (Array.isArray(parsed)) {
+      tourFaqs = parsed.filter((f: any) => f && f.question && f.answer);
+    }
+  } catch { /* no FAQs stored */ }
   const faqSchema = tourFaqs && tourFaqs.length > 0
     ? {
         '@type': 'FAQPage',
@@ -381,7 +387,7 @@ export default async function SlugPage({ params }: Props) {
           availability: 'https://schema.org/InStock',
           url: tourUrl,
           priceValidUntil: '2026-12-31',
-          seller: { '@type': 'TravelAgency', name: 'GlobeWithLocals', url: 'https://globewithlocals.com' },
+          seller: { '@type': 'TravelAgency', name: 'GlobeWithLocals', url: 'https://www.globewithlocals.com' },
         },
         // Real reviews only. A rating derived from the tour id is fabricated markup
         // (a structured-data policy violation), so no reviews means no aggregateRating.
@@ -418,13 +424,13 @@ export default async function SlugPage({ params }: Props) {
           priceCurrency: tour?.currency || 'USD',
           availability: 'https://schema.org/InStock',
           url: tourUrl,
-          seller: { '@type': 'TravelAgency', name: 'GlobeWithLocals', url: 'https://globewithlocals.com' },
+          seller: { '@type': 'TravelAgency', name: 'GlobeWithLocals', url: 'https://www.globewithlocals.com' },
         },
         provider: {
           '@type': 'TravelAgency',
           name: 'GlobeWithLocals',
-          url: 'https://globewithlocals.com',
-          '@id': 'https://globewithlocals.com/#organization',
+          url: 'https://www.globewithlocals.com',
+          '@id': 'https://www.globewithlocals.com/#organization',
         },
         contentLocation: {
           '@type': 'City',
@@ -436,18 +442,18 @@ export default async function SlugPage({ params }: Props) {
       {
         '@type': 'BreadcrumbList',
         itemListElement: [
-          { '@type': 'ListItem', position: 1, name: 'Home', item: 'https://globewithlocals.com' },
-          { '@type': 'ListItem', position: 2, name: countryName, item: `https://globewithlocals.com/${countrySlug}` },
-          { '@type': 'ListItem', position: 3, name: cityName, item: `https://globewithlocals.com/${countrySlug}/${citySlug}` },
+          { '@type': 'ListItem', position: 1, name: 'Home', item: 'https://www.globewithlocals.com' },
+          { '@type': 'ListItem', position: 2, name: countryName, item: `https://www.globewithlocals.com/${countrySlug}` },
+          { '@type': 'ListItem', position: 3, name: cityName, item: `https://www.globewithlocals.com/${countrySlug}/${citySlug}` },
           { '@type': 'ListItem', position: 4, name: tour?.title || 'Tour', item: tourUrl },
         ],
       },
       // Organization with ContactPoint — trust signals competitors carry (X-Ray 2026-08)
       {
         '@type': 'Organization',
-        '@id': 'https://globewithlocals.com/#organization',
+        '@id': 'https://www.globewithlocals.com/#organization',
         name: 'GlobeWithLocals',
-        url: 'https://globewithlocals.com',
+        url: 'https://www.globewithlocals.com',
         contactPoint: {
           '@type': 'ContactPoint',
           contactType: 'customer service',

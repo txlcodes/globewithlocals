@@ -11,7 +11,7 @@ export const metadata: Metadata = {
   title: 'GlobeWithLocals - Authentic Local Tours & Experiences Worldwide | Verified Local Guides',
   description: 'Discover authentic local tours and experiences around the world. Book with verified local guides in Italy, Spain, Greece, Turkey, Portugal, France and more. Skip-the-line landmarks, food and wine walks, old-town walking tours and private day trips.',
   alternates: {
-    canonical: 'https://globewithlocals.com',
+    canonical: 'https://www.globewithlocals.com',
   },
 };
 
@@ -22,9 +22,9 @@ export default function HomePage() {
     '@graph': [
       {
         '@type': 'Organization',
-        '@id': 'https://globewithlocals.com/#organization',
+        '@id': 'https://www.globewithlocals.com/#organization',
         name: 'GlobeWithLocals',
-        url: 'https://globewithlocals.com',
+        url: 'https://www.globewithlocals.com',
         description: 'GlobeWithLocals connects travelers with verified, licensed local guides around the world. Book skip-the-line landmark tours, food and wine walks, old-town walking tours and private day trips in Italy, Spain, Greece, Turkey, Portugal, France and more.',
         foundingDate: '2024',
         areaServed: [
@@ -51,11 +51,11 @@ export default function HomePage() {
       },
       {
         '@type': 'WebSite',
-        '@id': 'https://globewithlocals.com/#website',
+        '@id': 'https://www.globewithlocals.com/#website',
         name: 'GlobeWithLocals',
-        url: 'https://globewithlocals.com',
+        url: 'https://www.globewithlocals.com',
         description: 'Discover authentic local tours and experiences worldwide with verified local guides.',
-        publisher: { '@id': 'https://globewithlocals.com/#organization' },
+        publisher: { '@id': 'https://www.globewithlocals.com/#organization' },
         // No SearchAction: the site has no /search route, and the template URL
         // sat in GSC as a 404 for months.
       },

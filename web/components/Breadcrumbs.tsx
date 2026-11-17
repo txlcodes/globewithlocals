@@ -14,21 +14,21 @@ const Breadcrumbs: React.FC<BreadcrumbsProps> = ({ country, city, tourTitle, slu
 
     // Build BreadcrumbList JSON-LD schema
     const items: { position: number; name: string; item: string }[] = [
-        { position: 1, name: 'Home', item: 'https://globewithlocals.com' }
+        { position: 1, name: 'Home', item: 'https://www.globewithlocals.com' }
     ];
     if (country && countrySlug) {
-        items.push({ position: 2, name: country, item: `https://globewithlocals.com/${countrySlug}` });
+        items.push({ position: 2, name: country, item: `https://www.globewithlocals.com/${countrySlug}` });
     }
     if (city && citySlug && countrySlug) {
-        items.push({ position: 3, name: city, item: `https://globewithlocals.com/${countrySlug}/${citySlug}` });
+        items.push({ position: 3, name: city, item: `https://www.globewithlocals.com/${countrySlug}/${citySlug}` });
     }
     if (tourTitle && city && country) {
         items.push({
             position: items.length + 1,
             name: tourTitle,
             item: slug
-                ? `https://globewithlocals.com/${countrySlug}/${citySlug}/${slug}`
-                : `https://globewithlocals.com/${countrySlug}/${citySlug}`
+                ? `https://www.globewithlocals.com/${countrySlug}/${citySlug}/${slug}`
+                : `https://www.globewithlocals.com/${countrySlug}/${citySlug}`
         });
     }
 
