@@ -96,6 +96,22 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   };
 }
 
+
+// Tours beyond the card cap, as title+slug only (~100 bytes each), so every tour in a big city is
+// a crawlable link without shipping 500 full cards.
+async function moreTourLinks(countryName: string, cityName: string, skip: number): Promise<{ slug: string; title: string }[]> {
+  try {
+    const res = await fetch(
+      `${API_URL}/api/public/tours?country=${encodeURIComponent(countryName)}&city=${encodeURIComponent(cityName)}&status=approved&limit=1000&offset=${skip}`,
+      { next: { revalidate: 900 } }
+    );
+    if (!res.ok) return [];
+    const data = await res.json();
+    const arr = Array.isArray(data.tours) ? data.tours : [];
+    return arr.filter((t: any) => t && t.slug && t.title).map((t: any) => ({ slug: String(t.slug), title: String(t.title) }));
+  } catch { return []; }
+}
+
 const CITY_PAGE_TOUR_CAP = 200;
 
 export default async function CityPage({ params }: Props) {
@@ -204,6 +220,7 @@ export default async function CityPage({ params }: Props) {
   const cityOgImage = tours.find(t => t.images?.[0])?.images?.[0] || 'https://www.globewithlocals.com/favicon-96x96-v7.png';
   const todayISO = new Date().toISOString().split('T')[0];
 
+  const moreLinks = tours.length >= CITY_PAGE_TOUR_CAP ? await moreTourLinks(countryName, cityName, CITY_PAGE_TOUR_CAP) : [];
   const jsonLd = {
     '@context': 'https://schema.org',
     '@graph': [
@@ -330,7 +347,7 @@ export default async function CityPage({ params }: Props) {
         type="application/ld+json"
         dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
       />
-      <CityPageClient tours={tours} city={cityName} country={countryName} />
+      <CityPageClient tours={tours} moreLinks={moreLinks} city={cityName} country={countryName} />
       {faqs.length > 0 && (
         <section className="max-w-4xl mx-auto px-4 sm:px-6 py-10" aria-label={`${cityName} tours FAQ`}>
           <h2 className="text-2xl font-bold text-gray-900 mb-4">Frequently asked questions about {cityName} tours</h2>

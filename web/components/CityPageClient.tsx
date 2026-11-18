@@ -22,6 +22,7 @@ import Breadcrumbs from '@/components/Breadcrumbs';
 
 interface CityPageClientProps {
   tours: any[];
+  moreLinks?: { slug: string; title: string }[];
   country: string;
   city: string;
 }
@@ -337,7 +338,7 @@ const formatDurationDisplay = (durationStr: string | null | undefined) => {
   return durationStr;
 };
 
-export default function CityPageClient({ tours: initialTours, city, country }: CityPageClientProps) {
+export default function CityPageClient({ tours: initialTours, moreLinks = [], city, country }: CityPageClientProps) {
   const { t } = useLanguage();
   const tours = initialTours;
   const [filterCategory, setFilterCategory] = useState<string>('all');
@@ -743,11 +744,11 @@ export default function CityPageClient({ tours: initialTours, city, country }: C
             </div>
             {/* Every tour as a plain link, so crawlers (and screen readers) get the
                 full inventory even though the card grid is paged. ~100 bytes a link. */}
-            {tours.length > visibleCount && (
+            {(tours.length > visibleCount || moreLinks.length > 0) && (
               <details className="mb-8 text-[13px] text-gray-500">
-                <summary className="cursor-pointer font-semibold text-[#001A33]">All {tours.length} tours in {city}, A to Z</summary>
+                <summary className="cursor-pointer font-semibold text-[#001A33]">All {tours.length + moreLinks.length} tours in {city}, A to Z</summary>
                 <ul className="mt-3 columns-1 sm:columns-2 lg:columns-3 gap-6 [&>li]:break-inside-avoid">
-                  {[...tours].sort((a, b) => a.title.localeCompare(b.title)).map((t) => (
+                  {[...tours, ...moreLinks].sort((a, b) => a.title.localeCompare(b.title)).map((t) => (
                     <li key={t.slug} className="py-0.5">
                       <Link href={`/${countrySlug}/${citySlug}/${t.slug}`} className="hover:text-[#10B981]">{t.title}</Link>
                     </li>
