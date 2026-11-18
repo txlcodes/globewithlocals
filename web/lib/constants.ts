@@ -18,20 +18,9 @@ export interface AttractionData {
 }
 
 export const CITIES: CityData[] = [
-  // Launch order: Rome first, then the rest of Europe. guidesCount is the
-  // number of verified operators once a city has supply; 0 until then.
-  { id: 'rome', name: 'Rome', image: PLACEHOLDER_IMG, localAngle: 'Eternal City', guidesCount: 0 },
-  { id: 'florence', name: 'Florence', image: PLACEHOLDER_IMG, localAngle: 'Renaissance Capital', guidesCount: 0 },
-  { id: 'venice', name: 'Venice', image: PLACEHOLDER_IMG, localAngle: 'City of Canals', guidesCount: 0 },
-  { id: 'barcelona', name: 'Barcelona', image: PLACEHOLDER_IMG, localAngle: 'Gaudí & Gothic Quarter', guidesCount: 0 },
-  { id: 'athens', name: 'Athens', image: PLACEHOLDER_IMG, localAngle: 'Cradle of Democracy', guidesCount: 0 },
-  { id: 'istanbul', name: 'Istanbul', image: PLACEHOLDER_IMG, localAngle: 'Where Continents Meet', guidesCount: 0 },
-  { id: 'lisbon', name: 'Lisbon', image: PLACEHOLDER_IMG, localAngle: 'City of Seven Hills', guidesCount: 0 },
-  { id: 'paris', name: 'Paris', image: PLACEHOLDER_IMG, localAngle: 'City of Light', guidesCount: 0 },
-  { id: 'prague', name: 'Prague', image: PLACEHOLDER_IMG, localAngle: 'City of a Hundred Spires', guidesCount: 0 },
-  { id: 'santorini', name: 'Santorini', image: PLACEHOLDER_IMG, localAngle: 'Caldera Sunsets', guidesCount: 0 },
-  { id: 'dubrovnik', name: 'Dubrovnik', image: PLACEHOLDER_IMG, localAngle: 'Pearl of the Adriatic', guidesCount: 0 },
-  { id: 'cappadocia', name: 'Cappadocia', image: PLACEHOLDER_IMG, localAngle: 'Fairy Chimneys & Balloons', guidesCount: 0 },
+  // City by city launch. Only cities with live tours appear here; add the next
+  // one the day its supply is imported and reviewed.
+  { id: 'rome', name: 'Rome', image: 'https://images.globewithlocals.com/rome/colosseum-roman-forum-and-palatine-hill-walk-with-a-local-guide/1.webp', localAngle: '500+ tours and day trips', guidesCount: 500 },
 ];
 
 export const ATTRACTIONS: AttractionData[] = [
