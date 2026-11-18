@@ -20,7 +20,7 @@ export interface AttractionData {
 export const CITIES: CityData[] = [
   // City by city launch. Only cities with live tours appear here; add the next
   // one the day its supply is imported and reviewed.
-  { id: 'rome', name: 'Rome', image: 'https://images.globewithlocals.com/rome/colosseum-roman-forum-and-palatine-hill-walk-with-a-local-guide/1.webp', localAngle: '500+ tours and day trips', guidesCount: 500 },
+  { id: 'rome', name: 'Rome', image: 'https://images.globewithlocals.com/site/city-rome/1600.webp', localAngle: '500+ tours and day trips', guidesCount: 500 },
 ];
 
 export const ATTRACTIONS: AttractionData[] = [

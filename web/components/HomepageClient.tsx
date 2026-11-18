@@ -1,5 +1,6 @@
 'use client';
 import { PLACEHOLDER_IMG } from '@/lib/placeholder';
+import { sitePhoto } from '@/lib/sitePhotos';
 
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import Link from 'next/link';
@@ -33,38 +34,38 @@ interface ExploreItem {
 
 const EXPLORATION_DATA: Record<string, ExploreItem[]> = {
   attractions: [
-    { name: "Colosseum, Rome", count: "Rome", image: PLACEHOLDER_IMG },
-    { name: "Sagrada Familia, Barcelona", count: "Barcelona", image: PLACEHOLDER_IMG },
-    { name: "Acropolis, Athens", count: "Athens", image: PLACEHOLDER_IMG },
-    { name: "Hagia Sophia, Istanbul", count: "Istanbul", image: PLACEHOLDER_IMG },
-    { name: "Uffizi Gallery, Florence", count: "Florence", image: PLACEHOLDER_IMG },
-    { name: "Grand Canal, Venice", count: "Venice", image: PLACEHOLDER_IMG },
-    { name: "Eiffel Tower, Paris", count: "Paris", image: PLACEHOLDER_IMG },
-    { name: "Belem Tower, Lisbon", count: "Lisbon", image: PLACEHOLDER_IMG },
-    { name: "Charles Bridge, Prague", count: "Prague", image: PLACEHOLDER_IMG },
-    { name: "Old Town Walls, Dubrovnik", count: "Dubrovnik", image: PLACEHOLDER_IMG },
-    { name: "Hot Air Balloons, Cappadocia", count: "Cappadocia", image: PLACEHOLDER_IMG },
-    { name: "Oia Sunset, Santorini", count: "Santorini", image: PLACEHOLDER_IMG }
+    { name: "Colosseum, Rome", count: "Rome", image: sitePhoto('poi-colosseum') },
+    { name: "Sagrada Familia, Barcelona", count: "Barcelona", image: sitePhoto('poi-sagrada') },
+    { name: "Acropolis, Athens", count: "Athens", image: sitePhoto('poi-acropolis') },
+    { name: "Hagia Sophia, Istanbul", count: "Istanbul", image: sitePhoto('poi-hagia-sophia') },
+    { name: "Uffizi Gallery, Florence", count: "Florence", image: sitePhoto('poi-uffizi') },
+    { name: "Grand Canal, Venice", count: "Venice", image: sitePhoto('poi-grand-canal') },
+    { name: "Eiffel Tower, Paris", count: "Paris", image: sitePhoto('poi-eiffel') },
+    { name: "Belem Tower, Lisbon", count: "Lisbon", image: sitePhoto('poi-belem') },
+    { name: "Charles Bridge, Prague", count: "Prague", image: sitePhoto('poi-charles-bridge') },
+    { name: "Old Town Walls, Dubrovnik", count: "Dubrovnik", image: sitePhoto('poi-dubrovnik-walls') },
+    { name: "St Peter's Basilica, Vatican City", count: "Rome", image: sitePhoto('poi-vatican') },
+    { name: "Oia Sunset, Santorini", count: "Santorini", image: sitePhoto('poi-oia') }
   ],
   destinations: [
-    { name: "Rome, Italy", count: "Italy", image: PLACEHOLDER_IMG },
-    { name: "Barcelona, Spain", count: "Spain", image: PLACEHOLDER_IMG },
-    { name: "Athens, Greece", count: "Greece", image: PLACEHOLDER_IMG },
-    { name: "Istanbul, Turkey", count: "Turkey", image: PLACEHOLDER_IMG },
-    { name: "Lisbon, Portugal", count: "Portugal", image: PLACEHOLDER_IMG },
-    { name: "Paris, France", count: "France", image: PLACEHOLDER_IMG }
+    { name: "Rome, Italy", count: "Italy", image: sitePhoto('city-rome') },
+    { name: "Barcelona, Spain", count: "Spain", image: sitePhoto('city-barcelona') },
+    { name: "Athens, Greece", count: "Greece", image: sitePhoto('city-athens') },
+    { name: "Istanbul, Turkey", count: "Turkey", image: sitePhoto('city-istanbul') },
+    { name: "Lisbon, Portugal", count: "Portugal", image: sitePhoto('city-lisbon') },
+    { name: "Paris, France", count: "France", image: sitePhoto('city-paris') }
   ],
   countries: [
-    { name: "Italy", count: "Rome · Florence · Venice", image: PLACEHOLDER_IMG },
-    { name: "Spain", count: "Barcelona · Madrid · Seville", image: PLACEHOLDER_IMG },
-    { name: "Greece", count: "Athens · Santorini", image: PLACEHOLDER_IMG },
-    { name: "Turkey", count: "Istanbul · Cappadocia", image: PLACEHOLDER_IMG }
+    { name: "Italy", count: "Rome · Florence · Venice", image: sitePhoto('city-florence') },
+    { name: "Spain", count: "Barcelona · Madrid · Seville", image: sitePhoto('city-seville') },
+    { name: "Greece", count: "Athens · Santorini", image: sitePhoto('city-santorini') },
+    { name: "Turkey", count: "Istanbul", image: sitePhoto('city-istanbul') }
   ],
   categories: [
-    { name: "Skip-the-line Landmarks", count: "Guided tours", image: PLACEHOLDER_IMG },
-    { name: "Food & Wine Walks", count: "Guided tours", image: PLACEHOLDER_IMG },
-    { name: "Day Trips", count: "Guided tours", image: PLACEHOLDER_IMG },
-    { name: "Old Town Walking Tours", count: "Guided tours", image: PLACEHOLDER_IMG }
+    { name: "Skip-the-line Landmarks", count: "Guided tours", image: sitePhoto('poi-vatican') },
+    { name: "Food & Wine Walks", count: "Guided tours", image: sitePhoto('city-porto') },
+    { name: "Day Trips", count: "Guided tours", image: sitePhoto('city-naples') },
+    { name: "Old Town Walking Tours", count: "Guided tours", image: sitePhoto('city-prague') }
   ]
 };
 
@@ -203,39 +204,38 @@ const ExplorationFooter: React.FC = () => {
 // ── Hero Images ──────────────────────────────────────────────────────
 
 const HERO_IMAGES = [
-  { url: PLACEHOLDER_IMG, city: 'Rome' },
-  { url: PLACEHOLDER_IMG, city: 'Santorini' },
-  { url: PLACEHOLDER_IMG, city: 'Istanbul' },
-  { url: PLACEHOLDER_IMG, city: 'Barcelona' },
-  { url: PLACEHOLDER_IMG, city: 'Lisbon' },
-  { url: PLACEHOLDER_IMG, city: 'Venice' },
-  { url: PLACEHOLDER_IMG, city: 'Cappadocia' },
-  { url: PLACEHOLDER_IMG, city: 'Dubrovnik' }
+  { url: sitePhoto('city-rome'), city: 'Rome' },
+  { url: sitePhoto('city-santorini'), city: 'Santorini' },
+  { url: sitePhoto('city-istanbul'), city: 'Istanbul' },
+  { url: sitePhoto('city-barcelona'), city: 'Barcelona' },
+  { url: sitePhoto('city-lisbon'), city: 'Lisbon' },
+  { url: sitePhoto('city-venice'), city: 'Venice' },
+  { url: sitePhoto('city-florence'), city: 'Florence' },
+  { url: sitePhoto('city-dubrovnik'), city: 'Dubrovnik' }
 ];
 
 // ── City guides data for "Trip inspiration" dropdown ─────────────────
 
 const CITY_GUIDES = [
-  { name: 'Rome', image: PLACEHOLDER_IMG },
-  { name: 'Florence', image: PLACEHOLDER_IMG },
-  { name: 'Venice', image: PLACEHOLDER_IMG },
-  { name: 'Barcelona', image: PLACEHOLDER_IMG },
-  { name: 'Madrid', image: PLACEHOLDER_IMG },
-  { name: 'Seville', image: PLACEHOLDER_IMG },
-  { name: 'Athens', image: PLACEHOLDER_IMG },
-  { name: 'Santorini', image: PLACEHOLDER_IMG },
-  { name: 'Istanbul', image: PLACEHOLDER_IMG },
-  { name: 'Cappadocia', image: PLACEHOLDER_IMG },
-  { name: 'Lisbon', image: PLACEHOLDER_IMG },
-  { name: 'Porto', image: PLACEHOLDER_IMG },
-  { name: 'Paris', image: PLACEHOLDER_IMG },
-  { name: 'Amsterdam', image: PLACEHOLDER_IMG },
-  { name: 'Prague', image: PLACEHOLDER_IMG },
-  { name: 'London', image: PLACEHOLDER_IMG },
-  { name: 'Dubrovnik', image: PLACEHOLDER_IMG },
-  { name: 'Vienna', image: PLACEHOLDER_IMG },
-  { name: 'Budapest', image: PLACEHOLDER_IMG },
-  { name: 'Berlin', image: PLACEHOLDER_IMG }
+  { name: 'Rome', image: sitePhoto('city-rome') },
+  { name: 'Florence', image: sitePhoto('city-florence') },
+  { name: 'Venice', image: sitePhoto('city-venice') },
+  { name: 'Barcelona', image: sitePhoto('city-barcelona') },
+  { name: 'Madrid', image: sitePhoto('city-madrid') },
+  { name: 'Seville', image: sitePhoto('city-seville') },
+  { name: 'Athens', image: sitePhoto('city-athens') },
+  { name: 'Santorini', image: sitePhoto('city-santorini') },
+  { name: 'Istanbul', image: sitePhoto('city-istanbul') },
+  { name: 'Lisbon', image: sitePhoto('city-lisbon') },
+  { name: 'Porto', image: sitePhoto('city-porto') },
+  { name: 'Paris', image: sitePhoto('city-paris') },
+  { name: 'Amsterdam', image: sitePhoto('city-amsterdam') },
+  { name: 'Prague', image: sitePhoto('city-prague') },
+  { name: 'London', image: sitePhoto('city-london') },
+  { name: 'Dubrovnik', image: sitePhoto('city-dubrovnik') },
+  { name: 'Vienna', image: sitePhoto('city-vienna') },
+  { name: 'Budapest', image: sitePhoto('city-budapest') },
+  { name: 'Berlin', image: sitePhoto('city-berlin') }
 ];
 
 const CITY_GUIDE_ID_MAP: Record<string, string> = {
@@ -599,6 +599,8 @@ export default function HomepageClient() {
             <img
               key={index}
               src={imageLoader({ src: hero.url, width: 1600 })}
+              srcSet={`${imageLoader({ src: hero.url, width: 1600 })} 1600w, ${imageLoader({ src: hero.url, width: 3840 })} 3840w`}
+              sizes="100vw"
               alt={`${hero.city} - Authentic local tours and cultural experiences in ${hero.city}`}
               className={`absolute inset-0 w-full h-full object-cover object-center brightness-[0.7] transition-opacity duration-1000 ${index === currentImageIndex ? 'opacity-100 z-0' : 'opacity-0 z-0'}`}
               style={{ width: '100%', height: '100%', objectFit: 'cover', objectPosition: 'center' }}
@@ -804,7 +806,7 @@ export default function HomepageClient() {
           <div
             className="absolute inset-0 bg-cover bg-center bg-no-repeat"
             style={{
-              backgroundImage: `url(PLACEHOLDER_IMG)`,
+              backgroundImage: `url(${imageLoader({ src: sitePhoto('city-santorini'), width: 1600 })})`,
             }}
           />
           {/* Top gradient: white fading into image */}
