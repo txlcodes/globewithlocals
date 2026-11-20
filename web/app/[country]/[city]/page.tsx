@@ -100,16 +100,22 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
 // Tours beyond the card cap, as title+slug only (~100 bytes each), so every tour in a big city is
 // a crawlable link without shipping 500 full cards.
 async function moreTourLinks(countryName: string, cityName: string, skip: number): Promise<{ slug: string; title: string }[]> {
+  const out: { slug: string; title: string }[] = [];
   try {
-    const res = await fetch(
-      `${API_URL}/api/public/tours?country=${encodeURIComponent(countryName)}&city=${encodeURIComponent(cityName)}&status=approved&limit=1000&offset=${skip}`,
-      { next: { revalidate: 900 } }
-    );
-    if (!res.ok) return [];
-    const data = await res.json();
-    const arr = Array.isArray(data.tours) ? data.tours : [];
-    return arr.filter((t: any) => t && t.slug && t.title).map((t: any) => ({ slug: String(t.slug), title: String(t.title) }));
-  } catch { return []; }
+    // The API returns at most 1000 rows per call, so page through the rest.
+    for (let offset = skip; offset < 6000; offset += 1000) {
+      const res = await fetch(
+        `${API_URL}/api/public/tours?country=${encodeURIComponent(countryName)}&city=${encodeURIComponent(cityName)}&status=approved&limit=1000&offset=${offset}`,
+        { next: { revalidate: 900 } }
+      );
+      if (!res.ok) break;
+      const data = await res.json();
+      const arr = Array.isArray(data.tours) ? data.tours : [];
+      for (const t of arr) if (t && t.slug && t.title) out.push({ slug: String(t.slug), title: String(t.title) });
+      if (arr.length < 1000) break;
+    }
+  } catch { /* keep what we have */ }
+  return out;
 }
 
 const CITY_PAGE_TOUR_CAP = 200;
