@@ -20,7 +20,7 @@ export interface AttractionData {
 export const CITIES: CityData[] = [
   // City by city launch. Only cities with live tours appear here; add the next
   // one the day its supply is imported and reviewed.
-  { id: 'rome', name: 'Rome', image: 'https://images.globewithlocals.com/site/city-rome/1600.webp', localAngle: '1,900+ tours and day trips', guidesCount: 1980 },
+  { id: 'rome', name: 'Rome', image: 'https://images.globewithlocals.com/site/city-rome/1600.webp', localAngle: '2,000+ tours and day trips', guidesCount: 2048 },
 ];
 
 export const ATTRACTIONS: AttractionData[] = [
