@@ -599,8 +599,6 @@ export default function HomepageClient() {
             <img
               key={index}
               src={imageLoader({ src: hero.url, width: 1600 })}
-              srcSet={`${imageLoader({ src: hero.url, width: 1600 })} 1600w, ${imageLoader({ src: hero.url, width: 3840 })} 3840w`}
-              sizes="100vw"
               alt={`${hero.city} - Authentic local tours and cultural experiences in ${hero.city}`}
               className={`absolute inset-0 w-full h-full object-cover object-center brightness-[0.7] transition-opacity duration-1000 ${index === currentImageIndex ? 'opacity-100 z-0' : 'opacity-0 z-0'}`}
               style={{ width: '100%', height: '100%', objectFit: 'cover', objectPosition: 'center' }}

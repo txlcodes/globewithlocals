@@ -10,8 +10,13 @@ function ladderWidth(width: number): number {
 // Only rewrite real ladder files (128/384/640/1600.webp). Gallery photos are named 1.webp, 2.webp ... and must pass through untouched.
 const NATIVE = /^(https?:\/\/.+)\/(128|384|640|1600|3840)\.webp$/;
 
+// Tour card thumbnails: rome/<slug>/1_w640.webp sits next to 1.webp (full 1600px). Small slots load the thumb.
+const TOUR_FIRST = /^(https?:\/\/.+\/rome\/[^/]+)\/1\.webp$/;
+
 export function imageLoader({ src, width }: { src: string; width: number; quality?: number }): string {
   const m = typeof src === 'string' && src.startsWith(IMAGE_HOST) ? src.match(NATIVE) : null;
   if (m) return `${m[1]}/${ladderWidth(width)}.webp`;
+  const t = typeof src === 'string' && src.startsWith(IMAGE_HOST) && width <= 800 ? src.match(TOUR_FIRST) : null;
+  if (t) return `${t[1]}/1_w640.webp`;
   return src;
 }
