@@ -1679,9 +1679,10 @@ const TourDetailClient: React.FC<TourDetailClientProps> = ({ tour: initialTour, 
                           : (hardcodedReviews?.averageRating || 0);
                         const cnt = realReviewStats?.totalReviews ?? hardcodedReviews?.totalReviews ?? 0;
                         if (!avg || avg <= 0) return null;
+                        const external = !realReviewStats && (hardcodedReviews as any)?.source === 'other-platform';
                         return (
                           <div className="flex items-center gap-2">
-                            {avg >= 4.5 && cnt >= 10 && (
+                            {!external && avg >= 4.5 && cnt >= 10 && (
                               <span className="px-2 py-1 bg-[#10B981] text-white text-[12px] font-black rounded">
                                 Top rated
                               </span>
@@ -1692,7 +1693,7 @@ const TourDetailClient: React.FC<TourDetailClientProps> = ({ tour: initialTour, 
                               ))}
                             </div>
                             <span className="text-[16px] font-black text-[#001A33]">{avg.toFixed(1)}</span>
-                            {cnt > 0 && <span className="text-[14px] text-gray-500 font-semibold">({cnt.toLocaleString()} reviews)</span>}
+                            {cnt > 0 && <span className="text-[14px] text-gray-500 font-semibold">({cnt.toLocaleString()} reviews{external ? ' on another platform' : ''})</span>}
                           </div>
                         );
                       })()}
@@ -3136,7 +3137,7 @@ const TourDetailClient: React.FC<TourDetailClientProps> = ({ tour: initialTour, 
                           </div>
 
                           {/* Right: Category bars */}
-                          <div className="flex-1 flex flex-col gap-3 justify-center max-w-sm">
+                          {displayGuideRating > 0 && (<div className="flex-1 flex flex-col gap-3 justify-center max-w-sm">
                             <div className="flex items-center gap-3">
                               <span className="text-sm font-semibold text-gray-700 w-32">Guide</span>
                               <div className="flex-1 h-2.5 bg-gray-100 rounded-full overflow-hidden">
@@ -3151,11 +3152,11 @@ const TourDetailClient: React.FC<TourDetailClientProps> = ({ tour: initialTour, 
                               </div>
                               <span className="text-sm font-bold text-[#001A33] w-10 text-right">{displayValueRating}/5</span>
                             </div>
-                          </div>
+                          </div>)}
                         </div>
 
                         {/* Verified badge — only truthful when every review is our own booking */}
-                        {(() => {
+                        {(reviewData as any)?.source !== 'other-platform' && (() => {
                           const carried = hardcodedReviews?.reviews?.some(
                             r => r.country === 'Verified traveller review'
                           );
