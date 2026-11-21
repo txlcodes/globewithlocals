@@ -20,6 +20,8 @@ export interface TourReviewData {
     guideRating: number;
     valueRating: number;
     reviews: TourReview[];
+    /** 'other-platform' = reviews of this same tour from another booking platform; the page labels them as such. */
+    source?: string;
 }
 
 export const getTourReviews = (_slug: string | undefined): TourReviewData | null => null;

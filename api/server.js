@@ -9818,7 +9818,7 @@ app.get('/api/public/tours/by-slug/:slug', async (req, res) => {
     if (tour.reviews) {
       try {
         // Never show another company's name: scrub author labels and drop any review whose text names one.
-        const COMPETITOR_RE = /klook|tripadvisor|tiqets/i;
+        const COMPETITOR_RE = /klook|tripadvisor|tiqets|getyourguide|get your guide|viator|civitatis|\bgyg\b|asiabylocals|globebylocals/i;
         const rd = JSON.parse(tour.reviews);
         if (rd && Array.isArray(rd.reviews)) {
           rd.reviews = rd.reviews
