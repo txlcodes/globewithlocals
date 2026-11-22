@@ -3,6 +3,9 @@ import { notFound, permanentRedirect } from 'next/navigation';
 import { CITY_URL_MAP } from '@/lib/cityCountryMap';
 import { getCityInfoContent } from '@/lib/cityInfoContent';
 import { EUROPE_GUIDES } from '@/lib/guides';
+import { getAuthorityPage } from '@/lib/authority';
+import AuthorityPageView from '@/components/AuthorityPage';
+import TourAnswerBox from '@/components/TourAnswerBox';
 import { getTourReviews } from '@/lib/tourReviews';
 import Link from 'next/link';
 import TourDetailClient from '@/components/TourDetailClient';
@@ -94,6 +97,17 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { country, city, slug } = await params;
   const cityName = capitalize(city);
 
+  const authPage = getAuthorityPage(city, slug);
+  if (authPage) {
+    const u = `https://www.globewithlocals.com/${authPage.country}/${authPage.city}/${authPage.slug}`;
+    return {
+      title: `${authPage.seoTitle} | GlobeWithLocals`,
+      description: authPage.description,
+      alternates: { canonical: u },
+      openGraph: { title: authPage.seoTitle, description: authPage.description, url: u, siteName: 'GlobeWithLocals', type: 'article' },
+    };
+  }
+
   if (isInfoSlug(city, slug)) {
     const infoContent = getCityInfoContent(slug);
     const fallbackTitle = slug.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
@@ -184,6 +198,11 @@ export default async function SlugPage({ params }: Props) {
   const countryName = countryDisplayName(country);
   const countrySlug = country.toLowerCase();
   const citySlug = city.toLowerCase();
+
+  const authPageR = getAuthorityPage(city, slug);
+  if (authPageR) {
+    return <AuthorityPageView page={authPageR} />;
+  }
 
   // City info page
   if (isInfoSlug(city, slug)) {
@@ -511,6 +530,7 @@ export default async function SlugPage({ params }: Props) {
       />
       {/* SEO: visible H1 with city name is rendered by TourDetailClient. No duplicate hidden H1. */}
       <TourDetailClient tour={tour} city={cityName} country={countryName} specificFaqs={tourFaqs || []} hardcodedReviews={tourReviewData} />
+      <TourAnswerBox tour={tour} city={cityName} country={countryName} reviewData={tourReviewData} />
 
       {/* Server-rendered internal links — visible to Google crawler in raw HTML */}
       {otherTourLinks.length > 0 && (

@@ -9125,7 +9125,8 @@ async function servePagedTours(req, res) {
     const { city, country, category } = req.query;
     const limit = Math.min(parseInt(req.query.limit, 10), 1000);
     const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
-    const key = [city, country, category, limit, offset].map(v => String(v ?? '').toLowerCase()).join('|');
+    const qTerms = String(req.query.q || '').split(',').map(x => x.trim().toLowerCase()).filter(x => x.length >= 3).slice(0, 12);
+    const key = [city, country, category, limit, offset, qTerms.join('~')].map(v => String(v ?? '').toLowerCase()).join('|');
     const hit = pagedToursCache.get(key);
     if (hit && Date.now() - hit.at < PAGED_TTL_MS) { res.json(hit.payload); return true; }
 
@@ -9133,6 +9134,7 @@ async function servePagedTours(req, res) {
     if (city) where.city = { equals: city, mode: 'insensitive' };
     if (country) where.country = { equals: country, mode: 'insensitive' };
     if (category) where.category = category;
+    if (qTerms.length) where.OR = qTerms.map(t => ({ title: { contains: t, mode: 'insensitive' } }));
 
     const [total, rows] = await Promise.all([
       prisma.tour.count({ where }),

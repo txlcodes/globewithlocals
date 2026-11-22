@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from 'next'
 import { Plus_Jakarta_Sans } from 'next/font/google'
 import Script from 'next/script'
 import Footer from '@/components/Footer'
+import WhatsAppFloat from '@/components/WhatsAppFloat'
 import LanguageBoot from '@/components/LanguageBoot'
 import './globals.css'
 
@@ -102,6 +103,7 @@ export default function RootLayout({
           {children}
           <Footer />
         </div>
+        <WhatsAppFloat />
       </body>
     </html>
   )
