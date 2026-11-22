@@ -5,7 +5,6 @@ import { getCityInfoContent } from '@/lib/cityInfoContent';
 import { EUROPE_GUIDES } from '@/lib/guides';
 import { getAuthorityPage } from '@/lib/authority';
 import AuthorityPageView from '@/components/AuthorityPage';
-import TourAnswerBox from '@/components/TourAnswerBox';
 import { getTourReviews } from '@/lib/tourReviews';
 import Link from 'next/link';
 import TourDetailClient from '@/components/TourDetailClient';
@@ -530,7 +529,6 @@ export default async function SlugPage({ params }: Props) {
       />
       {/* SEO: visible H1 with city name is rendered by TourDetailClient. No duplicate hidden H1. */}
       <TourDetailClient tour={tour} city={cityName} country={countryName} specificFaqs={tourFaqs || []} hardcodedReviews={tourReviewData} />
-      <TourAnswerBox tour={tour} city={cityName} country={countryName} reviewData={tourReviewData} />
 
       {/* Server-rendered internal links — visible to Google crawler in raw HTML */}
       {otherTourLinks.length > 0 && (

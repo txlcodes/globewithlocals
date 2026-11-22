@@ -24,12 +24,12 @@ export const CITIES: CityData[] = [
 ];
 
 export const ATTRACTIONS: AttractionData[] = [
-  { id: 'a1', title: 'Colosseum', location: 'Rome', whyLocal: 'Gladiator history beyond the audio guide', experts: 0, image: PLACEHOLDER_IMG },
-  { id: 'a2', title: 'Sagrada Família', location: 'Barcelona', whyLocal: 'Reading Gaudí\'s symbolism stone by stone', experts: 0, image: PLACEHOLDER_IMG },
-  { id: 'a3', title: 'Acropolis', location: 'Athens', whyLocal: 'Myth, marble and the view locals climb for', experts: 0, image: PLACEHOLDER_IMG },
-  { id: 'a4', title: 'Hagia Sophia', location: 'Istanbul', whyLocal: 'Two empires, one dome, told by a local', experts: 0, image: PLACEHOLDER_IMG },
-  { id: 'a5', title: 'Grand Canal', location: 'Venice', whyLocal: 'Back-canal routes the gondola queues never see', experts: 0, image: PLACEHOLDER_IMG },
-  { id: 'a6', title: 'Cappadocia Valleys', location: 'Cappadocia', whyLocal: 'Cave churches and sunrise balloons with a local', experts: 0, image: PLACEHOLDER_IMG },
+  { id: 'a1', title: 'Colosseum', location: 'Rome', whyLocal: 'Gladiator history beyond the audio guide', experts: 0, image: 'https://images.globewithlocals.com/rome/colosseum-roman-forum-and-palatine-hill-walk-with-a-local-guide/1.webp' },
+  { id: 'a2', title: 'Vatican Museums', location: 'Rome', whyLocal: 'The Sistine Chapel without the wandering', experts: 0, image: 'https://images.globewithlocals.com/rome/guided-vatican-museums-and-sistine-chapel-visit-with-basilica-and-dome-options/2.webp' },
+  { id: 'a3', title: 'Pantheon', location: 'Rome', whyLocal: 'Nearly two thousand years under one dome', experts: 0, image: 'https://images.globewithlocals.com/rome/pantheon-entry-with-audio-guide-and-host-support/1.webp' },
+  { id: 'a4', title: 'Catacombs of Rome', location: 'Rome', whyLocal: 'Early Christian Rome, underground', experts: 0, image: 'https://images.globewithlocals.com/rome/underground-rome-st-callixtus-catacombs-with-a-guide/1.webp' },
+  { id: 'a5', title: 'Trevi Fountain', location: 'Rome', whyLocal: 'The aqueduct beneath the fountain', experts: 0, image: 'https://images.globewithlocals.com/rome/trevi-fountain-visit-with-a-descent-into-the-underground-aqueduct/1.webp' },
+  { id: 'a6', title: "Tivoli and Hadrian's Villa", location: 'Rome', whyLocal: "An emperor's retreat outside Rome", experts: 0, image: 'https://images.globewithlocals.com/rome/half-day-excursion-to-tivoli-s-hadrian-s-villa-and-renaissance-gardens/1.webp' },
 ];
 
 // Moved to lib/cityCountryMap.ts so middleware.ts can import it without

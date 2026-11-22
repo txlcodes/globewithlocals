@@ -3111,7 +3111,7 @@ const TourDetailClient: React.FC<TourDetailClientProps> = ({ tour: initialTour, 
                         </div>
                         {reviewData && (reviewData as any).source === 'other-platform' && (
                           <p className="-mt-4 mb-6 text-sm text-gray-500">
-                            These are guest reviews of this same tour from another booking platform. GlobeWithLocals is new, so reviews from guests who book with us will be added here as they come in.
+                            Reviews from travelers on this operator's experience, from another platform. GlobeWithLocals is new, so reviews from guests who book with us will be added here as they come in.
                           </p>
                         )}
 
