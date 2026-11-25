@@ -19,7 +19,8 @@ export default function StaticPageHeader() {
                     <ArrowLeft size={18} />
                     {t.back}
                 </button>
-                <Link href="/" className="flex items-center h-full">
+                <Link href="/" className="flex items-center gap-2 h-full">
+                    <img src="/icon-192.png" alt="" width="36" height="36" className="h-8 w-8 sm:h-9 sm:w-9 rounded-lg" />
                     <span className="text-2xl sm:text-3xl font-black tracking-tight text-[#001A33]">GlobeWithLocals</span>
                 </Link>
                 <LanguageSwitcher />
