@@ -6616,6 +6616,40 @@ const verifyAdmin = (req, res, next) => {
   }
 };
 
+// Fill the review summary columns (reviewAvg/reviewCount, used for list cards and popularity
+// ordering) from the review data already stored in tours.reviews. Scoped to one country+city
+// and only to rows whose summary is still empty; it reads the existing blob and writes exactly
+// those two columns, nothing else. Same admin-header guard as the other /api/admin routes.
+// Body: { country, city, dryRun? }
+app.post('/api/admin/tours/review-summary-sync', verifyAdmin, async (req, res) => {
+  try {
+    const country = String(req.body?.country || '').trim();
+    const city = String(req.body?.city || '').trim();
+    if (!country || !city) return res.status(400).json({ success: false, error: 'country and city required' });
+    const dryRun = !!req.body?.dryRun;
+    const rows = await prisma.tour.findMany({
+      where: {
+        country: { equals: country, mode: 'insensitive' }, city: { equals: city, mode: 'insensitive' },
+        reviewCount: null, reviews: { not: null }
+      },
+      select: { id: true, reviews: true }
+    });
+    let updated = 0, skipped = 0;
+    for (const t of rows) {
+      let d = null;
+      try { d = JSON.parse(t.reviews); } catch { d = null; }
+      const avg = Number(d?.averageRating), n = Math.round(Number(d?.totalReviews));
+      if (!d || !Number.isFinite(avg) || avg <= 0 || avg > 5 || !Number.isFinite(n) || n <= 0) { skipped++; continue; }
+      if (!dryRun) await prisma.tour.update({ where: { id: t.id }, data: { reviewAvg: avg, reviewCount: n } });
+      updated++;
+    }
+    res.json({ success: true, dryRun, candidates: rows.length, updated, skipped });
+  } catch (error) {
+    console.error('review-summary-sync error:', error.message);
+    res.status(500).json({ success: false, error: 'Failed to sync review summaries' });
+  }
+});
+
 // Delete tour (admin - can delete any status)
 app.delete('/api/admin/tours/:id', verifyAdmin, async (req, res) => {
   try {
