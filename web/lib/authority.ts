@@ -15,11 +15,15 @@ export interface AuthorityPage {
   faqs: { q: string; a: string }[];
   terms: string[];    // title keywords for the tour list; empty = all top tours
   related: string[];  // other slugs
+  guide?: boolean;    // information guide: show the guide text first, tours after
 }
+
+import { GUIDE_PAGES } from './authorityGuides';
 
 const R = { country: 'italy', city: 'rome' };
 
 export const AUTHORITY_PAGES: AuthorityPage[] = [
+  ...GUIDE_PAGES,
   {
     ...R, slug: 'best-tours-in-rome', title: 'Best Tours in Rome', seoTitle: 'Best Tours in Rome: Top-Reviewed Guided Tours and Tickets',
     description: 'How to pick the best tours in Rome: what is worth booking, what to book ahead, and the most-reviewed guided tours, tickets and day trips from local operators.',
@@ -39,7 +43,7 @@ export const AUTHORITY_PAGES: AuthorityPage[] = [
       { q: 'Are the reviews on these tours from GlobeWithLocals customers?', a: 'No. GlobeWithLocals is new. Where a tour shows reviews, they are guest reviews of this same tour from another booking platform, and each page says so. Reviews from guests who book with us are added as they come in.' },
       { q: 'Can I talk to someone before booking?', a: 'Yes. Message us on WhatsApp and we will help you choose a tour and date.' },
     ],
-    terms: [], related: ['best-colosseum-tours-rome', 'best-vatican-tours-rome', 'best-day-trips-from-rome', 'best-food-tours-rome'],
+    terms: [], related: ['best-colosseum-tours-rome', 'best-vatican-tours-rome', 'best-day-trips-from-rome', 'best-food-tours-rome', 'rome-3-day-itinerary', 'best-time-to-visit-rome', 'where-to-stay-in-rome'],
   },
   {
     ...R, slug: 'best-colosseum-tours-rome', title: 'Best Colosseum Tours in Rome', seoTitle: 'Best Colosseum Tours in Rome: Guided, Arena Floor and Underground',
@@ -56,7 +60,7 @@ export const AUTHORITY_PAGES: AuthorityPage[] = [
       { q: 'How long does a Colosseum tour take?', a: 'A combined Colosseum, Forum and Palatine Hill tour usually runs between two and three hours, depending on the option.' },
       { q: 'Do I need to book the Colosseum in advance?', a: 'Yes. Entry is timed and busy dates sell out, so book as soon as your dates are fixed.' },
     ],
-    terms: ['colosseum'], related: ['best-tours-in-rome', 'best-skip-the-line-tickets-rome', 'best-walking-tours-rome', 'best-catacombs-and-underground-rome-tours'],
+    terms: ['colosseum'], related: ['best-tours-in-rome', 'best-skip-the-line-tickets-rome', 'best-walking-tours-rome', 'best-catacombs-and-underground-rome-tours', 'colosseum-tickets-explained-rome'],
   },
   {
     ...R, slug: 'best-vatican-tours-rome', title: 'Best Vatican Tours in Rome', seoTitle: 'Best Vatican Museums and Sistine Chapel Tours in Rome',
@@ -73,7 +77,7 @@ export const AUTHORITY_PAGES: AuthorityPage[] = [
       { q: 'What should I wear to the Vatican?', a: 'Cover shoulders and knees. Bring a light scarf in summer.' },
       { q: 'How long does a Vatican tour take?', a: 'Most run between two and four hours depending on whether the Basilica is included.' },
     ],
-    terms: ['vatican', 'sistine'], related: ['best-st-peters-basilica-tours-rome', 'best-tours-in-rome', 'best-skip-the-line-tickets-rome', 'best-private-tours-rome'],
+    terms: ['vatican', 'sistine'], related: ['best-st-peters-basilica-tours-rome', 'best-tours-in-rome', 'best-skip-the-line-tickets-rome', 'best-private-tours-rome', 'vatican-museums-visiting-guide-rome'],
   },
   {
     ...R, slug: 'best-food-tours-rome', title: 'Best Food Tours in Rome', seoTitle: 'Best Food Tours in Rome: Pasta, Pizza, Gelato and Markets',
@@ -240,7 +244,7 @@ export const AUTHORITY_PAGES: AuthorityPage[] = [
     sections: [{ h: 'The Pantheon', p: ['The Pantheon is nearly two thousand years old and still has the world\'s largest unreinforced concrete dome. It is a working church and entry rules can change, so check the tour page.'] }, { h: 'Fountains and squares', p: ['Piazza Navona is built on a Roman stadium and has Bernini\'s Fountain of the Four Rivers. The Trevi Fountain is a short walk away.'] }],
     choose: ['Check the visit time.', 'Prefer small groups for narrow lanes.'],
     faqs: [{ q: 'How long to see these sights?', a: 'Allow two to three hours for a relaxed walk with stops.' }],
-    terms: ['pantheon', 'trevi', 'piazza navona', 'spanish steps', 'fountain'], related: ['best-walking-tours-rome', 'best-night-tours-rome', 'best-hidden-gems-and-trastevere-tours-rome', 'best-tours-in-rome'],
+    terms: ['pantheon', 'trevi', 'piazza navona', 'spanish steps', 'fountain'], related: ['best-walking-tours-rome', 'best-night-tours-rome', 'best-hidden-gems-and-trastevere-tours-rome', 'best-tours-in-rome', 'pantheon-rome-visiting-guide', 'trevi-fountain-rome-guide'],
   },
   {
     ...R, slug: 'best-appian-way-and-ostia-antica-tours', title: 'Best Appian Way and Ostia Antica Tours', seoTitle: 'Best Appian Way, Catacombs and Ostia Antica Tours from Rome',
@@ -267,7 +271,7 @@ export const AUTHORITY_PAGES: AuthorityPage[] = [
     sections: [{ h: 'Fiumicino and Ciampino', p: ['Fiumicino is the main international airport west of the city. Ciampino, to the south-east, serves many budget airlines. Both are roughly 30 to 60 minutes from the centre depending on traffic.'] }],
     choose: ['Give your flight number so the driver can track delays.', 'Check luggage limits.'],
     faqs: [{ q: 'Is a pre-booked transfer worth it?', a: 'It gives a fixed price and removes queues for taxis, especially after a late arrival.' }],
-    terms: ['transfer', 'airport', 'driver', 'shuttle'], related: ['best-private-tours-rome', 'best-cruise-shore-excursions-rome-civitavecchia', 'best-day-trips-from-rome', 'best-tours-in-rome'],
+    terms: ['transfer', 'airport', 'driver', 'shuttle'], related: ['best-private-tours-rome', 'best-cruise-shore-excursions-rome-civitavecchia', 'best-day-trips-from-rome', 'best-tours-in-rome', 'rome-airport-to-city-centre-guide'],
   },
   {
     ...R, slug: 'best-cruise-shore-excursions-rome-civitavecchia', title: 'Best Rome Shore Excursions from Civitavecchia', seoTitle: 'Best Rome Cruise Shore Excursions from Civitavecchia',

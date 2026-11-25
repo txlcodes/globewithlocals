@@ -52,8 +52,39 @@ export default async function AuthorityPageView({ page }: { page: AuthorityPage 
       <div className="mt-5 space-y-4 text-base leading-relaxed text-slate-700">{page.intro.map((p, i) => <p key={i}>{p}</p>)}</div>
       <div className="mt-5 flex flex-wrap gap-3"><Cta label="Chat with us on WhatsApp" /><a href="#tours" className="rounded-full border border-slate-300 px-5 py-3 text-sm font-bold">See {tours.length || ''} tours</a></div>
 
+      {page.guide ? (<>
+      {page.sections.map((s, i) => (
+        <section key={i} className="mt-10">
+          <h2 className="text-2xl font-black">{s.h}</h2>
+          <div className="mt-3 space-y-4 leading-relaxed text-slate-700">{s.p.map((p, j) => <p key={j}>{p}</p>)}</div>
+        </section>
+      ))}
+
       <section id="tours" className="mt-10">
-        <h2 className="text-2xl font-black">Most-reviewed tours</h2>
+        <h2 className="text-2xl font-black">{page.guide ? 'Tours that fit this trip' : 'Most-reviewed tours'}</h2>
+        <p className="mt-1 text-sm text-slate-500">Ordered by number of guest reviews. Reviews shown on tour pages are for the same tour on another booking platform. Prices are per person.</p>
+        <div className="mt-5 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
+          {tours.map((t: any) => (
+            <Link key={t.id} href={`/italy/rome/${t.slug}`} className="group overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm hover:shadow-md">
+              {t.images?.[0] && <img src={imageLoader({ src: t.images[0], width: 640 })} alt={t.title} loading="lazy" className="h-44 w-full object-cover" />}
+              <div className="p-4">
+                <div className="line-clamp-2 text-sm font-bold group-hover:underline">{t.title}</div>
+                <div className="mt-2 flex items-center justify-between text-xs text-slate-500">
+                  <span>{t.duration || ''}</span>
+                  {t.reviewCount > 0 && <span>{Number(t.reviewAvg).toFixed(1)} ★ ({t.reviewCount} on another platform)</span>}
+                </div>
+                <div className="mt-2 text-base font-black">from {money(t.pricePerPerson, t.currency || 'USD')}</div>
+              </div>
+            </Link>
+          ))}
+        </div>
+        {tours.length === 0 && <p className="mt-4 text-slate-500">Tours load shortly. Message us on WhatsApp and we will send options.</p>}
+        <div className="mt-6"><Cta label="Not sure which one? Message us on WhatsApp" /></div>
+      </section>
+
+      </>) : (<>
+      <section id="tours" className="mt-10">
+        <h2 className="text-2xl font-black">{page.guide ? 'Tours that fit this trip' : 'Most-reviewed tours'}</h2>
         <p className="mt-1 text-sm text-slate-500">Ordered by number of guest reviews. Reviews shown on tour pages are for the same tour on another booking platform. Prices are per person.</p>
         <div className="mt-5 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
           {tours.map((t: any) => (
@@ -80,6 +111,8 @@ export default async function AuthorityPageView({ page }: { page: AuthorityPage 
           <div className="mt-3 space-y-4 leading-relaxed text-slate-700">{s.p.map((p, j) => <p key={j}>{p}</p>)}</div>
         </section>
       ))}
+
+      </>)}
 
       <section className="mt-10 rounded-2xl bg-slate-50 p-6">
         <h2 className="text-xl font-black">How to choose</h2>
