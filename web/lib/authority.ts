@@ -15,6 +15,7 @@ export interface AuthorityPage {
   faqs: { q: string; a: string }[];
   terms: string[];    // title keywords for the tour list; empty = all top tours
   related: string[];  // other slugs
+  topRated?: boolean; // rank by rating (min review count) instead of review volume
   guide?: boolean;    // information guide: show the guide text first, tours after
 }
 

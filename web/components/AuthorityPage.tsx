@@ -7,20 +7,29 @@ import { WA_NUMBER, waLink } from '@/lib/whatsapp';
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:3001';
 const SITE = 'https://www.globewithlocals.com';
 
-async function fetchTours(terms: string[]) {
+async function fetchTours(terms: string[], topRated = false) {
   try {
     const q = terms.length ? `&q=${encodeURIComponent(terms.join(','))}` : '';
-    const res = await fetch(`${API_URL}/api/public/tours?country=Italy&city=Rome&limit=24${q}`, { next: { revalidate: 1800 } });
+    const limit = topRated ? 300 : 24;
+    const res = await fetch(`${API_URL}/api/public/tours?country=Italy&city=Rome&limit=${limit}${q}`, { next: { revalidate: 1800 } });
     if (!res.ok) return [];
     const d = await res.json();
-    return Array.isArray(d.tours) ? d.tours : [];
+    let tours = Array.isArray(d.tours) ? d.tours : [];
+    if (topRated) {
+      const skip = /transfer|shuttle|coach|airport|bus pass|open-top/i;
+      tours = tours
+        .filter((t: any) => t.reviewCount >= 100 && t.reviewAvg >= 4.7 && !skip.test(t.title))
+        .sort((a: any, b: any) => b.reviewAvg - a.reviewAvg || b.reviewCount - a.reviewCount)
+        .slice(0, 18);
+    }
+    return tours;
   } catch { return []; }
 }
 
 const money = (n: number, c: string) => (c === 'USD' ? '$' : c + ' ') + Math.round(n);
 
 export default async function AuthorityPageView({ page }: { page: AuthorityPage }) {
-  const tours = await fetchTours(page.terms);
+  const tours = await fetchTours(page.terms, page.topRated);
   const url = `${SITE}/${page.country}/${page.city}/${page.slug}`;
   const wa = waLink(`Hi, I am looking at "${page.title}" on GlobeWithLocals and need help choosing a tour.`);
   const related = page.related.map((s) => AUTHORITY_PAGES.find((p) => p.slug === s)).filter(Boolean) as AuthorityPage[];
@@ -61,7 +70,7 @@ export default async function AuthorityPageView({ page }: { page: AuthorityPage 
       ))}
 
       <section id="tours" className="mt-10">
-        <h2 className="text-2xl font-black">{page.guide ? 'Tours that fit this trip' : 'Most-reviewed tours'}</h2>
+        <h2 className="text-2xl font-black">{page.guide ? 'Tours that fit this trip' : page.topRated ? 'Highest-rated tours' : 'Most-reviewed tours'}</h2>
         <p className="mt-1 text-sm text-slate-500">Ordered by number of guest reviews. Reviews shown on tour pages are for the same tour on another booking platform. Prices are per person.</p>
         <div className="mt-5 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
           {tours.map((t: any) => (

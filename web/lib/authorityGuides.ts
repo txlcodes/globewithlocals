@@ -10,6 +10,39 @@ const R = { country: 'italy', city: 'rome', guide: true };
 
 export const GUIDE_PAGES: AuthorityPage[] = [
   {
+    ...R, guide: false, topRated: true, slug: 'top-rated-tours-in-rome', title: 'Top-Rated Tours in Rome',
+    seoTitle: 'Top-Rated Tours in Rome: Highest-Rated Guided Tours and Tickets',
+    description: 'The highest-rated tours in Rome, ranked by traveller rating with a minimum review count: Colosseum, Vatican, food, Vespa and more, with live prices.',
+    intro: [
+      'These are the best-rated tours in Rome that we offer, ranked by traveller rating. To keep the list meaningful, a tour needs at least 100 reviews and a rating of 4.7 or higher to appear, and airport transfers are left out because they are rated on a different basis.',
+      'The ratings come from travellers who took the same tour through another booking platform. GlobeWithLocals is new, so these are not reviews of bookings made with us, and each card says so. Prices are per person and update live.',
+    ],
+    sections: [
+      { h: 'How we rank these tours', p: [
+        'We sort by average rating first and by the number of reviews second, and we require a minimum of 100 reviews so that a handful of five-star ratings cannot push a tour to the top. A 4.8 from tens of thousands of travellers tells you more than a 5.0 from a few dozen.',
+      ] },
+      { h: 'What the ratings do and do not tell you', p: [
+        'A high rating means most travellers were satisfied with the guide, the timing and the organisation. It does not tell you whether the tour suits you. A food tour and a Vatican visit can both rate 4.8 and be completely different days. Read the tour page for the duration, the meeting point and what the entry ticket includes.',
+      ] },
+      { h: 'If you only book two things in Rome', p: [
+        'The Colosseum with the Roman Forum and Palatine Hill, and the Vatican Museums with the Sistine Chapel, are the two visits where a guide and a fixed entry time make the biggest difference. Book both first, then add a food or Vespa evening for the other half of Rome.',
+      ] },
+    ],
+    choose: [
+      'Look at the number of reviews as well as the rating.',
+      'Match the tour to the kind of day you want, not only to the score.',
+      'Check what the entry ticket includes and the group size.',
+      'Message us on WhatsApp if you want help choosing a date.',
+    ],
+    faqs: [
+      { q: 'What are the best-rated tours in Rome?', a: 'The page above ranks them by rating with a minimum of 100 reviews. The Colosseum, Vatican, food and Vespa tours are consistently among the highest rated.' },
+      { q: 'Are these reviews from GlobeWithLocals customers?', a: 'No. GlobeWithLocals is new. The ratings are from travellers who took the same tour through another booking platform, and each card says so.' },
+      { q: 'Why are airport transfers not listed?', a: 'Transfers are rated on punctuality and convenience, which is a different basis from a guided experience, so we keep them out of this ranking.' },
+      { q: 'Are the prices on this page up to date?', a: 'Yes. Prices are per person and are read live from each tour page.' },
+    ],
+    terms: [], related: ['best-tours-in-rome', 'best-colosseum-tours-rome', 'best-vatican-tours-rome', 'best-food-tours-rome', 'rome-3-day-itinerary'],
+  },
+  {
     ...R, slug: 'best-time-to-visit-rome', title: 'Best Time to Visit Rome: Month by Month',
     seoTitle: 'Best Time to Visit Rome: Weather, Crowds and Month-by-Month Guide',
     description: 'When to visit Rome: temperatures, rain, crowds and closures by season, with the months that work best for walking, the Vatican and the Colosseum.',
