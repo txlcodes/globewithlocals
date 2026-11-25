@@ -6,6 +6,9 @@ import WhatsAppFloat from '@/components/WhatsAppFloat'
 import LanguageBoot from '@/components/LanguageBoot'
 import './globals.css'
 
+// GA4 measurement IDs are public (visible in page source), so a fallback here is safe.
+const GA_ID = process.env.NEXT_PUBLIC_GA_ID || 'G-7LQHX2VZSB'
+
 const plusJakartaSans = Plus_Jakarta_Sans({
   subsets: ['latin'],
   weight: ['400', '500', '600', '700', '800'],
@@ -92,10 +95,10 @@ export default function RootLayout({
       </head>
       <body className={`${plusJakartaSans.variable} font-sans antialiased`}>
 
-        {process.env.NEXT_PUBLIC_GA_ID && (
+        {GA_ID && (
           <>
-            <Script src={`https://www.googletagmanager.com/gtag/js?id=${process.env.NEXT_PUBLIC_GA_ID}`} strategy="afterInteractive" />
-            <Script id="ga4" strategy="afterInteractive">{`window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments)}gtag('js',new Date());gtag('config','${process.env.NEXT_PUBLIC_GA_ID}');`}</Script>
+            <Script src={`https://www.googletagmanager.com/gtag/js?id=${GA_ID}`} strategy="afterInteractive" />
+            <Script id="ga4" strategy="afterInteractive">{`window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments)}gtag('js',new Date());gtag('config','${GA_ID}');`}</Script>
           </>
         )}
         <LanguageBoot />
