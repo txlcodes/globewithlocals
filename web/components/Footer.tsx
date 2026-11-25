@@ -9,7 +9,7 @@ const Footer: React.FC = () => {
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-10 mb-12">
                     <div className="col-span-1 lg:col-span-1">
                         <Link href="/" className="inline-flex items-center gap-2 mb-4">
-                            <img src="/icon-192.png" alt="" width="36" height="36" className="h-8 w-8 sm:h-9 sm:w-9 rounded-lg" />
+                            <img src="/icon-192.png" alt="GlobeWithLocals logo" width="40" height="40" className="h-9 w-9 sm:h-10 sm:w-10 rounded-lg" />
                             <span className="text-2xl sm:text-3xl font-black tracking-tight text-white">GlobeWithLocals</span>
                         </Link>
                         <p className="text-gray-400 text-[13px] leading-relaxed">
