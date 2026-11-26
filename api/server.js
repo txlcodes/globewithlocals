@@ -6693,12 +6693,19 @@ app.post('/api/admin/tours/import', verifyAdmin, async (req, res) => {
         meetingPoint: t.meetingPoint || null, guideType: 'Local Guide', tourTypes: JSON.stringify([]), images: JSON.stringify(images),
         languages: JSON.stringify(['English']), itineraryItems: itinerary.length ? JSON.stringify(itinerary) : null,
         faqs: faqs.length ? JSON.stringify(faqs) : null, pickupIncluded: false,
+        activityProvider: typeof t.activityProvider === 'string' && t.activityProvider.trim() ? t.activityProvider.trim().slice(0, 120) : null,
         supplierId: supplier.id, status: st, approvedAt: st === 'approved' ? new Date() : null,
       };
       const rs = t.reviewSummary;
       if (rs && Number(rs.averageRating) > 0 && Number(rs.averageRating) <= 5 && Number(rs.totalReviews) > 0) {
         const avg = Math.round(Number(rs.averageRating) * 100) / 100, n = Math.round(Number(rs.totalReviews));
-        data.reviews = JSON.stringify({ averageRating: avg, totalReviews: n, guideRating: avg, valueRating: avg, reviews: [], source: 'other-platform' });
+        const OTHER = /get\s?your\s?guide|viator|klook|tripadvisor|tiqets|civitatis|headout|musement|expedia|trip\.com/i;
+        const list = (Array.isArray(rs.reviews) ? rs.reviews : [])
+          .filter((r) => r && typeof r.text === 'string' && r.text.trim().length >= 25 && Number(r.rating) >= 1 && Number(r.rating) <= 5 && !OTHER.test(r.text))
+          .slice(0, 15)
+          .map((r) => ({ author: OTHER.test(String(r.author || '')) ? 'Traveller' : (String(r.author || 'Traveller').trim().slice(0, 60) || 'Traveller'),
+            country: String(r.country || '').trim().slice(0, 60), rating: Number(r.rating), date: String(r.date || '').slice(0, 40), text: r.text.trim().slice(0, 2000) }));
+        data.reviews = JSON.stringify({ averageRating: avg, totalReviews: n, guideRating: avg, valueRating: avg, reviews: list, source: 'other-platform' });
         data.reviewAvg = avg; data.reviewCount = n;
       }
       const existing = await prisma.tour.findUnique({ where: { slug: t.slug }, select: { id: true } });

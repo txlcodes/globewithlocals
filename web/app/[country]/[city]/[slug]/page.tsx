@@ -39,9 +39,9 @@ function isValidSeoDescription(text: string | null | undefined): boolean {
   return !badPatterns.some(p => p.test(lower));
 }
 
-// Shorten a long tour title for meta tag (keep under 45 chars before " in City | Brand")
+// Shorten a long tour title for the meta tag (keep under ~65 chars; Google shows about 60)
 function shortenTitleForMeta(title: string): string {
-  if (title.length <= 45) return title;
+  if (title.length <= 65) return title;
   // Remove common filler patterns that inflate tour titles
   let short = title
     .replace(/\s*–\s*.*/g, '') // Remove everything after em-dash
@@ -49,9 +49,9 @@ function shortenTitleForMeta(title: string): string {
     .replace(/\s*\|\s*.*/g, '') // Remove everything after pipe
     .replace(/\s*\(.*?\)\s*/g, ' ') // Remove parenthetical text
     .replace(/\s+/g, ' ').trim();
-  if (short.length <= 45) return short;
+  if (short.length <= 65) return short;
   // Truncate at last word boundary before 45 chars
-  let truncated = short.substring(0, 45).replace(/\s+\S*$/, '').trim();
+  let truncated = short.substring(0, 65).replace(/\s+\S*$/, '').trim();
   // Remove dangling prepositions/conjunctions that make no sense at the end
   truncated = truncated.replace(/\s+(with|from|by|for|and|in|of|the|a|an|to|at|on|&)$/i, '').trim();
   return truncated;

@@ -1693,7 +1693,6 @@ const TourDetailClient: React.FC<TourDetailClientProps> = ({ tour: initialTour, 
                               ))}
                             </div>
                             <span className="text-[16px] font-black text-[#001A33]">{avg.toFixed(1)}</span>
-                            {cnt > 0 && <span className="text-[14px] text-gray-500 font-semibold">({cnt.toLocaleString()} reviews{external ? ' on another platform' : ''})</span>}
                           </div>
                         );
                       })()}

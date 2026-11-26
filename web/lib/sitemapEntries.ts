@@ -14,7 +14,7 @@ export const SITEMAP_CHUNK_SIZE = Number(process.env.SITEMAP_CHUNK_SIZE) || 4500
 // Fresh-start rollout: only tours in these cities are submitted. A city is added here
 // once its tours are rewritten and checked. Other cities stay live but leave the sitemap.
 const SITEMAP_CITIES = new Set(
-  (process.env.SITEMAP_CITIES || 'rome').split(',').map(c => c.trim().toLowerCase()).filter(Boolean),
+  (process.env.SITEMAP_CITIES || 'rome,florence').split(',').map(c => c.trim().toLowerCase()).filter(Boolean),
 );
 
 // Everything below is derived from CITY_URL_MAP (or fetched from the API).
