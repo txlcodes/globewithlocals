@@ -5,6 +5,7 @@ import React, { useState, useMemo, useEffect } from 'react';
 import Link from 'next/link';
 import Image from 'next/image';
 import { imageLoader } from '@/lib/imageLoader';
+import { sitePhoto } from '@/lib/sitePhotos';
 import { tagsForTitle, tagCounts } from '@/lib/tourTags';
 import { BALI_GUIDES } from '@/lib/guides';
 import { JAPAN_GUIDES } from '@/lib/guides';
@@ -264,7 +265,16 @@ const EmailSignupBox: React.FC<EmailSignupBoxProps> = ({ city, country }) => {
       <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
         <div className="grid grid-cols-1 md:grid-cols-3 gap-0">
           {/* Decorative panel */}
-          <div className="md:col-span-2 relative h-52 md:h-56 overflow-hidden bg-gradient-to-br from-[#10B981] to-[#001A33]" aria-hidden="true" />
+          <div className="md:col-span-2 relative h-52 md:h-56 overflow-hidden bg-gradient-to-br from-[#10B981] to-[#001A33]" aria-hidden="true">
+            {/* City photo over the gradient; if a city has no photo yet the gradient shows instead. */}
+            <img
+              src={imageLoader({ src: sitePhoto(`city-${city.toLowerCase().replace(/\s+/g, '-')}`), width: 1600 })}
+              alt=""
+              loading="lazy"
+              className="absolute inset-0 h-full w-full object-cover"
+              onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
+            />
+          </div>
 
           {/* Form Section */}
           <div className="md:col-span-1 bg-[#10B981]/10 p-4 md:p-5 flex flex-col justify-center relative z-20">
@@ -455,7 +465,7 @@ export default function CityPageClient({ tours: initialTours, moreLinks = [], ci
           <div className="flex items-center gap-3 h-full">
             {/* Logo - Clickable to Homepage */}
             <Link href="/" className="flex items-center h-full cursor-pointer">
-              <span className="text-2xl sm:text-3xl font-black tracking-tight text-[#001A33]">GlobeWithLocals</span>
+              <span className="flex items-center gap-2"><img src="/logo.png" alt="GlobeWithLocals logo" width="44" height="44" className="h-8 w-8 sm:h-11 sm:w-11 object-contain" /><span className="text-xl sm:text-3xl font-black tracking-tight text-[#001A33]">GlobeWithLocals</span></span>
             </Link>
           </div>
 

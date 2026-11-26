@@ -20,8 +20,8 @@ export default function StaticPageHeader() {
                     {t.back}
                 </button>
                 <Link href="/" className="flex items-center gap-2 h-full">
-                    <img src="/logo.png" alt="GlobeWithLocals logo" width="44" height="44" className="h-9 w-9 sm:h-11 sm:w-11 object-contain" />
-                    <span className="text-2xl sm:text-3xl font-black tracking-tight text-[#001A33]">GlobeWithLocals</span>
+                    <img src="/logo.png" alt="GlobeWithLocals logo" width="44" height="44" className="h-8 w-8 sm:h-11 sm:w-11 object-contain" />
+                    <span className="text-xl sm:text-3xl font-black tracking-tight text-[#001A33]">GlobeWithLocals</span>
                 </Link>
                 <LanguageSwitcher />
             </div>

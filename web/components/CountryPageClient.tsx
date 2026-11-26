@@ -275,7 +275,7 @@ export default function CountryPageClient({ country, countrySlug, cities, cityTo
       <header className="sticky top-0 z-50 bg-white border-b border-gray-200 shadow-sm">
         <div className="max-w-7xl mx-auto px-4 h-24 sm:h-28 flex items-center justify-between">
           <Link href="/" className="flex items-center h-full">
-            <span className="text-2xl sm:text-3xl font-black tracking-tight text-[#001A33]">GlobeWithLocals</span>
+            <span className="flex items-center gap-2"><img src="/logo.png" alt="GlobeWithLocals logo" width="44" height="44" className="h-8 w-8 sm:h-11 sm:w-11 object-contain" /><span className="text-xl sm:text-3xl font-black tracking-tight text-[#001A33]">GlobeWithLocals</span></span>
           </Link>
           <div className="flex items-center gap-3">
             <LanguageSwitcher />

@@ -100,7 +100,7 @@ export default function BookingConfirmationClient({ bookingId }: BookingConfirma
               Back to Home
             </button>
             <Link href="/" className="flex items-center h-full cursor-pointer">
-              <span className="text-2xl sm:text-3xl font-black tracking-tight text-[#001A33]">GlobeWithLocals</span>
+              <span className="flex items-center gap-2"><img src="/logo.png" alt="GlobeWithLocals logo" width="44" height="44" className="h-8 w-8 sm:h-11 sm:w-11 object-contain" /><span className="text-xl sm:text-3xl font-black tracking-tight text-[#001A33]">GlobeWithLocals</span></span>
             </Link>
           </div>
           <div className="text-center mb-6">

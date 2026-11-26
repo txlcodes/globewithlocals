@@ -364,8 +364,8 @@ export default function HomepageClient() {
         <div className="w-full h-24 sm:h-28 md:h-32 flex items-center justify-between px-3 sm:px-4 md:px-6">
           <div className="flex items-center gap-3 h-full">
             <Link href="/" className="cursor-pointer flex items-center gap-2">
-              <img src="/logo.png" alt="GlobeWithLocals logo" width="44" height="44" className="h-9 w-9 sm:h-11 sm:w-11 object-contain" />
-              <span className="text-2xl sm:text-3xl font-black tracking-tight text-[#001A33]">GlobeWithLocals</span>
+              <img src="/logo.png" alt="GlobeWithLocals logo" width="44" height="44" className="h-8 w-8 sm:h-11 sm:w-11 object-contain" />
+              <span className="text-xl sm:text-3xl font-black tracking-tight text-[#001A33]">GlobeWithLocals</span>
             </Link>
 
             <nav className="hidden lg:flex items-center gap-6 text-[14px] font-semibold text-[#001A33]">
