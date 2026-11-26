@@ -14,7 +14,7 @@ import { startReviewScheduler, sendDueReviewRequests } from './reviewScheduler.j
 import { startCheckoutRecovery, runCheckoutRecovery, sendInstantRecovery } from './checkoutRecovery.js';
 import { wakeCall, isWakeCallConfigured, describeWakeCall } from './utils/wakeCall.js';
 import { sendBookingAlert, sendPaymentFailedAlert, sendInquiryAlert, logAlertConfig } from './bookingPush.js';
-import { uploadMultipleImages } from './utils/r2.js';
+import { uploadMultipleImages, uploadImage } from './utils/r2.js';
 import { generateInvoicePDF } from './utils/invoice.js';
 import { generateSitemap } from './generate-sitemap.js';
 import mountAgentApi from './agent_api.js';
@@ -6647,6 +6647,73 @@ app.post('/api/admin/tours/review-summary-sync', verifyAdmin, async (req, res) =
   } catch (error) {
     console.error('review-summary-sync error:', error.message);
     res.status(500).json({ success: false, error: 'Failed to sync review summaries' });
+  }
+});
+
+// Import prepared (rewritten, validated) tours: the same mapping as scripts/import_tours.mjs, run on the
+// server so no DATABASE_URL or R2 keys are needed on the operator's machine. Upserts by slug, never
+// duplicates. Photos arrive as base64 and are stored in our own R2 bucket under <city>/<slug>/<n>.
+// A tour with fewer than 4 photos is always saved as draft. Body: { status, tours: [...] } (max 10).
+app.post('/api/admin/tours/import', verifyAdmin, async (req, res) => {
+  try {
+    const status = req.body?.status === 'approved' ? 'approved' : 'draft';
+    const tours = Array.isArray(req.body?.tours) ? req.body.tours : [];
+    if (!tours.length || tours.length > 10) return res.status(400).json({ success: false, error: 'tours must hold 1-10 entries' });
+    const arr = (v) => (Array.isArray(v) ? v.map((x) => String(x).trim()).filter(Boolean) : []);
+    const hrs = (h) => { const n = Number(h); return `${Number.isInteger(n) ? n : n.toFixed(1).replace(/\.0$/, '')} ${n === 1 ? 'hour' : 'hours'}`; };
+    const category = (t) => (/\b(ticket|tickets|entry|skip-the-line|admission|pass)\b/i.test(t) ? 'Entry Ticket' : 'Guided Tour');
+    const supplier = await prisma.supplier.findUnique({ where: { email: 'info@globewithlocals.com' } });
+    if (!supplier) return res.status(500).json({ success: false, error: 'import supplier missing' });
+    const results = [];
+    for (const t of tours) {
+      const problems = [];
+      if (!t.title || !t.slug || !t.description) problems.push('missing title/slug/description');
+      if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(String(t.slug || ''))) problems.push('bad slug');
+      if (!(Number(t.priceFromUSD) > 0)) problems.push('bad price');
+      if (!(Number(t.durationHours) > 0)) problems.push('bad duration');
+      if (!t.city || !t.country) problems.push('missing city/country');
+      if (problems.length) { results.push({ slug: t.slug, ok: false, problems }); continue; }
+      const citySlug = String(t.city).toLowerCase().replace(/\s+/g, '-');
+      let images = arr(t.images).filter((u) => u.startsWith('https://images.globewithlocals.com/'));
+      if (Array.isArray(t.imageData) && t.imageData.length) {
+        images = [];
+        for (let i = 0; i < Math.min(t.imageData.length, 8); i++) {
+          images.push(await uploadImage(t.imageData[i], `${citySlug}/${t.slug}`, String(i + 1)));
+        }
+      }
+      const faqs = (Array.isArray(t.faqs) ? t.faqs : []).filter((f) => f && f.question && f.answer);
+      const itinerary = Array.isArray(t.itinerary) ? t.itinerary : [];
+      const st = images.length < 4 ? 'draft' : status;
+      const data = {
+        title: t.title, slug: t.slug, country: t.country, city: t.city, category: category(t.title),
+        locations: JSON.stringify([t.city]), duration: hrs(t.durationHours), pricePerPerson: Number(t.priceFromUSD),
+        groupPricingTiers: Array.isArray(t.groupPricingTiers) && t.groupPricingTiers.length ? JSON.stringify(t.groupPricingTiers) : null,
+        currency: 'USD', shortDescription: t.shortDescription || null, fullDescription: t.description,
+        highlights: JSON.stringify(arr(t.highlights)), included: JSON.stringify(arr(t.inclusions)), notIncluded: JSON.stringify(arr(t.exclusions)),
+        meetingPoint: t.meetingPoint || null, guideType: 'Local Guide', tourTypes: JSON.stringify([]), images: JSON.stringify(images),
+        languages: JSON.stringify(['English']), itineraryItems: itinerary.length ? JSON.stringify(itinerary) : null,
+        faqs: faqs.length ? JSON.stringify(faqs) : null, pickupIncluded: false,
+        supplierId: supplier.id, status: st, approvedAt: st === 'approved' ? new Date() : null,
+      };
+      const rs = t.reviewSummary;
+      if (rs && Number(rs.averageRating) > 0 && Number(rs.averageRating) <= 5 && Number(rs.totalReviews) > 0) {
+        const avg = Math.round(Number(rs.averageRating) * 100) / 100, n = Math.round(Number(rs.totalReviews));
+        data.reviews = JSON.stringify({ averageRating: avg, totalReviews: n, guideRating: avg, valueRating: avg, reviews: [], source: 'other-platform' });
+        data.reviewAvg = avg; data.reviewCount = n;
+      }
+      const existing = await prisma.tour.findUnique({ where: { slug: t.slug }, select: { id: true } });
+      const tour = existing ? await prisma.tour.update({ where: { id: existing.id }, data }) : await prisma.tour.create({ data });
+      const opt = { optionTitle: t.title, optionDescription: t.shortDescription || t.title, durationHours: Number(t.durationHours), price: Number(t.priceFromUSD),
+        groupPricingTiers: data.groupPricingTiers, currency: 'USD', language: 'English', guideIncluded: true, sortOrder: 0 };
+      const hasOpt = await prisma.tourOption.findFirst({ where: { tourId: tour.id }, select: { id: true } });
+      if (hasOpt) await prisma.tourOption.update({ where: { id: hasOpt.id }, data: opt });
+      else await prisma.tourOption.create({ data: { ...opt, tourId: tour.id } });
+      results.push({ slug: t.slug, ok: true, id: tour.id, status: st, images: images.length, created: !existing });
+    }
+    res.json({ success: true, results });
+  } catch (error) {
+    console.error('admin tour import error:', error.message);
+    res.status(500).json({ success: false, error: 'Import failed', message: error.message });
   }
 });
 
