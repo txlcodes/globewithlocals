@@ -6704,7 +6704,17 @@ app.post('/api/admin/tours/import', verifyAdmin, async (req, res) => {
           .filter((r) => r && typeof r.text === 'string' && r.text.trim().length >= 25 && Number(r.rating) >= 1 && Number(r.rating) <= 5 && !OTHER.test(r.text))
           .slice(0, 15)
           .map((r) => ({ author: OTHER.test(String(r.author || '')) ? 'Traveller' : (String(r.author || 'Traveller').trim().slice(0, 60) || 'Traveller'),
-            country: String(r.country || '').trim().slice(0, 60), rating: Number(r.rating), date: String(r.date || '').slice(0, 40), text: r.text.trim().slice(0, 2000) }));
+            country: String(r.country || '').trim().slice(0, 60), rating: Number(r.rating), date: String(r.date || '').slice(0, 40), text: r.text.trim().slice(0, 2000),
+            photoData: Array.isArray(r.photoData) ? r.photoData.slice(0, 3) : [] }));
+        // Guest photos are rehosted in our own bucket, never hotlinked.
+        for (let i = 0; i < list.length; i++) {
+          const pics = [];
+          for (let j = 0; j < list[i].photoData.length; j++) {
+            pics.push(await uploadImage(list[i].photoData[j], `${citySlug}/${t.slug}/reviews`, `${i + 1}-${j + 1}`));
+          }
+          delete list[i].photoData;
+          if (pics.length) list[i].photos = pics;
+        }
         data.reviews = JSON.stringify({ averageRating: avg, totalReviews: n, guideRating: avg, valueRating: avg, reviews: list, source: 'other-platform' });
         data.reviewAvg = avg; data.reviewCount = n;
       }
