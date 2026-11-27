@@ -266,13 +266,10 @@ const EmailSignupBox: React.FC<EmailSignupBoxProps> = ({ city, country }) => {
         <div className="grid grid-cols-1 md:grid-cols-3 gap-0">
           {/* Decorative panel */}
           <div className="md:col-span-2 relative h-52 md:h-56 overflow-hidden bg-gradient-to-br from-[#10B981] to-[#001A33]" aria-hidden="true">
-            {/* City photo over the gradient; if a city has no photo yet the gradient shows instead. */}
-            <img
-              src={imageLoader({ src: sitePhoto(`city-${city.toLowerCase().replace(/\s+/g, '-')}`), width: 1600 })}
-              alt=""
-              loading="lazy"
-              className="absolute inset-0 h-full w-full object-cover"
-              onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
+            {/* City photo as a background layer over the gradient; if a city has no photo the gradient shows. */}
+            <div
+              className="absolute inset-0 bg-cover bg-center"
+              style={{ backgroundImage: `url(${sitePhoto(`city-${city.toLowerCase().replace(/\s+/g, '-')}`)})` }}
             />
           </div>
 
