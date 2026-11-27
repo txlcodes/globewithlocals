@@ -6720,11 +6720,22 @@ app.post('/api/admin/tours/import', verifyAdmin, async (req, res) => {
       }
       const existing = await prisma.tour.findUnique({ where: { slug: t.slug }, select: { id: true } });
       const tour = existing ? await prisma.tour.update({ where: { id: existing.id }, data }) : await prisma.tour.create({ data });
-      const opt = { optionTitle: t.title, optionDescription: t.shortDescription || t.title, durationHours: Number(t.durationHours), price: Number(t.priceFromUSD),
-        groupPricingTiers: data.groupPricingTiers, currency: 'USD', language: 'English', guideIncluded: true, sortOrder: 0 };
-      const hasOpt = await prisma.tourOption.findFirst({ where: { tourId: tour.id }, select: { id: true } });
-      if (hasOpt) await prisma.tourOption.update({ where: { id: hasOpt.id }, data: opt });
-      else await prisma.tourOption.create({ data: { ...opt, tourId: tour.id } });
+      // Options: t.options [{title, description, price, durationHours}] when the source page listed them, else one option = the tour.
+      const srcOpts = Array.isArray(t.options) && t.options.length
+        ? t.options.filter(o => o && o.title && Number(o.price) > 0).slice(0, 8)
+        : [{ title: t.title, description: t.shortDescription || t.title, price: t.priceFromUSD, durationHours: t.durationHours }];
+      const existingOpts = await prisma.tourOption.findMany({ where: { tourId: tour.id }, orderBy: { sortOrder: 'asc' }, select: { id: true, _count: { select: { bookings: true } } } });
+      for (let i = 0; i < srcOpts.length; i++) {
+        const o = srcOpts[i];
+        const opt = { optionTitle: String(o.title).slice(0, 200), optionDescription: String(o.description || o.title), durationHours: Number(o.durationHours || t.durationHours), price: Number(o.price),
+          groupPricingTiers: data.groupPricingTiers, currency: 'USD', language: 'English', guideIncluded: true, sortOrder: i };
+        if (existingOpts[i]) await prisma.tourOption.update({ where: { id: existingOpts[i].id }, data: opt });
+        else await prisma.tourOption.create({ data: { ...opt, tourId: tour.id } });
+      }
+      // Extra old options are removed only if no booking points at them.
+      for (const old of existingOpts.slice(srcOpts.length)) {
+        if (!old._count.bookings) await prisma.tourOption.delete({ where: { id: old.id } });
+      }
       results.push({ slug: t.slug, ok: true, id: tour.id, status: st, images: images.length, created: !existing });
     }
     res.json({ success: true, results });
