@@ -7,11 +7,13 @@ import { WA_NUMBER, waLink } from '@/lib/whatsapp';
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:3001';
 const SITE = 'https://www.globewithlocals.com';
 
-async function fetchTours(terms: string[], topRated = false) {
+const cap = (s: string) => s.split('-').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+
+async function fetchTours(country: string, city: string, terms: string[], topRated = false) {
   try {
     const q = terms.length ? `&q=${encodeURIComponent(terms.join(','))}` : '';
     const limit = topRated ? 300 : 24;
-    const res = await fetch(`${API_URL}/api/public/tours?country=Italy&city=Rome&limit=${limit}${q}`, { next: { revalidate: 1800 } });
+    const res = await fetch(`${API_URL}/api/public/tours?country=${encodeURIComponent(cap(country))}&city=${encodeURIComponent(cap(city))}&limit=${limit}${q}`, { next: { revalidate: 1800 } });
     if (!res.ok) return [];
     const d = await res.json();
     let tours = Array.isArray(d.tours) ? d.tours : [];
@@ -29,7 +31,10 @@ async function fetchTours(terms: string[], topRated = false) {
 const money = (n: number, c: string) => (c === 'USD' ? '$' : c + ' ') + Math.round(n);
 
 export default async function AuthorityPageView({ page }: { page: AuthorityPage }) {
-  const tours = await fetchTours(page.terms, page.topRated);
+  const tours = await fetchTours(page.country, page.city, page.terms, page.topRated);
+  const base = `/${page.country}/${page.city}`;
+  const countryName = cap(page.country);
+  const cityName = cap(page.city);
   const url = `${SITE}/${page.country}/${page.city}/${page.slug}`;
   const wa = waLink(`Hi, I am looking at "${page.title}" on GlobeWithLocals and need help choosing a tour.`);
   const related = page.related.map((s) => AUTHORITY_PAGES.find((p) => p.slug === s)).filter(Boolean) as AuthorityPage[];
@@ -38,11 +43,11 @@ export default async function AuthorityPageView({ page }: { page: AuthorityPage 
     '@graph': [
       { '@type': 'Article', headline: page.title, description: page.description, url, inLanguage: 'en', dateModified: new Date().toISOString().slice(0, 10), author: { '@type': 'Organization', name: 'GlobeWithLocals' }, publisher: { '@type': 'Organization', name: 'GlobeWithLocals', url: SITE } },
       { '@type': 'FAQPage', mainEntity: page.faqs.map((f) => ({ '@type': 'Question', name: f.q, acceptedAnswer: { '@type': 'Answer', text: f.a } })) },
-      { '@type': 'ItemList', name: page.title, numberOfItems: tours.length, itemListElement: tours.map((t: any, i: number) => ({ '@type': 'ListItem', position: i + 1, name: t.title, url: `${SITE}/italy/rome/${t.slug}` })) },
+      { '@type': 'ItemList', name: page.title, numberOfItems: tours.length, itemListElement: tours.map((t: any, i: number) => ({ '@type': 'ListItem', position: i + 1, name: t.title, url: `${SITE}${base}/${t.slug}` })) },
       { '@type': 'BreadcrumbList', itemListElement: [
         { '@type': 'ListItem', position: 1, name: 'Home', item: SITE },
-        { '@type': 'ListItem', position: 2, name: 'Italy', item: `${SITE}/italy` },
-        { '@type': 'ListItem', position: 3, name: 'Rome', item: `${SITE}/italy/rome` },
+        { '@type': 'ListItem', position: 2, name: countryName, item: `${SITE}/${page.country}` },
+        { '@type': 'ListItem', position: 3, name: cityName, item: `${SITE}${base}` },
         { '@type': 'ListItem', position: 4, name: page.title, item: url },
       ] },
     ],
@@ -55,7 +60,7 @@ export default async function AuthorityPageView({ page }: { page: AuthorityPage 
   return (
     <main className="mx-auto max-w-5xl px-4 pb-24 pt-24 text-[#001A33]">
       <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(ld) }} />
-      <nav className="mb-4 text-xs text-slate-500"><Link href="/">Home</Link> / <Link href="/italy">Italy</Link> / <Link href="/italy/rome">Rome</Link> / {page.title}</nav>
+      <nav className="mb-4 text-xs text-slate-500"><Link href="/">Home</Link> / <Link href={`/${page.country}`}>{countryName}</Link> / <Link href={base}>{cityName}</Link> / {page.title}</nav>
       <h1 className="text-3xl font-black md:text-4xl">{page.title}</h1>
       <p className="mt-2 text-sm text-slate-500">Updated {new Date().toLocaleDateString('en-GB', { month: 'long', year: 'numeric' })}. Tours and prices below are live.</p>
       <div className="mt-5 space-y-4 text-base leading-relaxed text-slate-700">{page.intro.map((p, i) => <p key={i}>{p}</p>)}</div>
@@ -74,7 +79,7 @@ export default async function AuthorityPageView({ page }: { page: AuthorityPage 
         <p className="mt-1 text-sm text-slate-500">Ordered by number of guest reviews. Reviews shown on tour pages are for the same tour on another booking platform. Prices are per person.</p>
         <div className="mt-5 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
           {tours.map((t: any) => (
-            <Link key={t.id} href={`/italy/rome/${t.slug}`} className="group overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm hover:shadow-md">
+            <Link key={t.id} href={`${base}/${t.slug}`} className="group overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm hover:shadow-md">
               {t.images?.[0] && <img src={imageLoader({ src: t.images[0], width: 640 })} alt={t.title} loading="lazy" className="h-44 w-full object-cover" />}
               <div className="p-4">
                 <div className="line-clamp-2 text-sm font-bold group-hover:underline">{t.title}</div>
@@ -97,7 +102,7 @@ export default async function AuthorityPageView({ page }: { page: AuthorityPage 
         <p className="mt-1 text-sm text-slate-500">Ordered by number of guest reviews. Reviews shown on tour pages are for the same tour on another booking platform. Prices are per person.</p>
         <div className="mt-5 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
           {tours.map((t: any) => (
-            <Link key={t.id} href={`/italy/rome/${t.slug}`} className="group overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm hover:shadow-md">
+            <Link key={t.id} href={`${base}/${t.slug}`} className="group overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm hover:shadow-md">
               {t.images?.[0] && <img src={imageLoader({ src: t.images[0], width: 640 })} alt={t.title} loading="lazy" className="h-44 w-full object-cover" />}
               <div className="p-4">
                 <div className="line-clamp-2 text-sm font-bold group-hover:underline">{t.title}</div>
@@ -136,7 +141,7 @@ export default async function AuthorityPageView({ page }: { page: AuthorityPage 
 
       {related.length > 0 && (
         <section className="mt-10">
-          <h2 className="text-xl font-black">More Rome guides</h2>
+          <h2 className="text-xl font-black">More {cityName} guides</h2>
           <ul className="mt-3 grid gap-2 sm:grid-cols-2">{related.map((r) => (<li key={r.slug}><Link className="font-semibold text-blue-700 hover:underline" href={`/${r.country}/${r.city}/${r.slug}`}>{r.title}</Link></li>))}</ul>
         </section>
       )}

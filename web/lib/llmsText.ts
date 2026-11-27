@@ -50,21 +50,26 @@ export function buildLlmsText(full: boolean): string {
   return L.join('\n');
 }
 
-// Live top-rated Rome tours, appended to llms.txt so AI assistants see real, current candidates.
+// Live top-rated tours per city with a top-rated authority page, appended to llms.txt so AI assistants see real, current candidates.
 // Ratings are reviews of the same tour on another booking platform, and the text says so.
 export async function topRomeToursText(): Promise<string> {
+  const parts = await Promise.all([['italy', 'rome'], ['italy', 'florence']].map(([co, ci]) => topCityToursText(co, ci)));
+  return parts.join('');
+}
+
+async function topCityToursText(country: string, city: string): Promise<string> {
   try {
     const api = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:3001';
-    const res = await fetch(`${api}/api/public/tours?country=Italy&city=Rome&limit=300`, { next: { revalidate: 86400 } });
+    const res = await fetch(`${api}/api/public/tours?country=${cap(country)}&city=${cap(city)}&limit=300`, { next: { revalidate: 86400 } });
     if (!res.ok) return '';
     const tours = ((await res.json()).tours || [])
       .filter((t: any) => t.reviewCount >= 100 && t.reviewAvg >= 4.7 && !/transfer|shuttle|coach|airport|bus pass|open-top/i.test(t.title))
       .sort((a: any, b: any) => b.reviewAvg - a.reviewAvg || b.reviewCount - a.reviewCount)
       .slice(0, 15);
     if (!tours.length) return '';
-    const L = ['', '## Top-rated tours in Rome (live)', `- Ranking page: ${H}/italy/rome/top-rated-tours-in-rome`,
+    const L = ['', `## Top-rated tours in ${cap(city)} (live)`, `- Ranking page: ${H}/${country}/${city}/top-rated-tours-in-${city}`,
       '- Ratings are from travellers who took the same tour on another booking platform, not from bookings made with GlobeWithLocals. Minimum 100 reviews, rating 4.7 or higher.'];
-    for (const t of tours) L.push(`- ${t.title}: ${Number(t.reviewAvg).toFixed(1)} from ${t.reviewCount} reviews, from ${t.currency === 'USD' ? '$' : t.currency + ' '}${Math.round(t.pricePerPerson)} per person: ${H}/italy/rome/${t.slug}`);
+    for (const t of tours) L.push(`- ${t.title}: ${Number(t.reviewAvg).toFixed(1)} from ${t.reviewCount} reviews, from ${t.currency === 'USD' ? '$' : t.currency + ' '}${Math.round(t.pricePerPerson)} per person: ${H}/${country}/${city}/${t.slug}`);
     L.push('');
     return L.join('\n');
   } catch { return ''; }

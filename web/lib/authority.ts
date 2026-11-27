@@ -1,4 +1,4 @@
-// Italy (Rome) authority pages. Each page pairs practical, checkable information with a live,
+// Italy authority pages (Rome here; Florence in authorityFlorence.ts). Each page pairs practical, checkable information with a live,
 // server-fetched list of our own tours matching `terms` (title keywords), so the page both informs
 // and sells. No prices, ratings or opening hours are hardcoded here: those come from the API.
 
@@ -20,6 +20,7 @@ export interface AuthorityPage {
 }
 
 import { GUIDE_PAGES } from './authorityGuides';
+import { FLORENCE_PAGES } from './authorityFlorence';
 
 const R = { country: 'italy', city: 'rome' };
 
@@ -347,11 +348,13 @@ export const AUTHORITY_PAGES: AuthorityPage[] = [
     ],
     terms: ['orvieto', 'assisi', 'civita', 'umbria', 'bagnoregio'], related: ['best-day-trips-from-rome', 'best-tivoli-tours-from-rome', 'best-wine-tours-and-tastings-rome', 'best-tours-in-rome'],
   },
+  ...FLORENCE_PAGES,
 ];
 
 export const AUTH_BY_CITY: Record<string, { name: string; slug: string; image: string }[]> = {
-  rome: AUTHORITY_PAGES.map((p) => ({ name: p.title, slug: p.slug, image: '' })),
 };
+// One entry per city that has authority pages (rome, florence, ...), in definition order.
+for (const p of AUTHORITY_PAGES) (AUTH_BY_CITY[p.city] ||= []).push({ name: p.title, slug: p.slug, image: '' });
 
 export function getAuthorityPage(city: string, slug: string): AuthorityPage | null {
   return AUTHORITY_PAGES.find((p) => p.city === city.toLowerCase() && p.slug === slug) || null;
