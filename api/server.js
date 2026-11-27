@@ -6728,7 +6728,7 @@ app.post('/api/admin/tours/import', verifyAdmin, async (req, res) => {
       for (let i = 0; i < srcOpts.length; i++) {
         const o = srcOpts[i];
         const opt = { optionTitle: String(o.title).slice(0, 200), optionDescription: String(o.description || o.title), durationHours: Number(o.durationHours || t.durationHours), price: Number(o.price),
-          groupPricingTiers: data.groupPricingTiers, currency: 'USD', language: 'English', guideIncluded: true, sortOrder: i };
+          groupPricingTiers: Array.isArray(o.groupPricingTiers) && o.groupPricingTiers.length ? JSON.stringify(o.groupPricingTiers) : data.groupPricingTiers, currency: 'USD', language: 'English', guideIncluded: true, sortOrder: i };
         if (existingOpts[i]) await prisma.tourOption.update({ where: { id: existingOpts[i].id }, data: opt });
         else await prisma.tourOption.create({ data: { ...opt, tourId: tour.id } });
       }
